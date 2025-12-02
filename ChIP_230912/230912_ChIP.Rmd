@@ -1,0 +1,2171 @@
+---
+title: "ChIPseq_230912"
+author: "Andrea"
+date: "2023/09/19"
+output: html_document
+---
+
+fastq location: /pipeline/Runs/NextSeq/230912_VH01624_21_AACWVFLM5/ProjectFolders/Project_Jesse-Balic/
+project directory: /dawson_genomics/Projects/CB_ChIP/ChIP_230912
+
+# set up project dir and process (fastqc, trim, align, tdfs)
+```{bash}
+mkdir alignment
+mkdir fastqc
+mkdir trimmed_fastqs
+mkdir logs
+mkdir scripts
+mkdir tdfs
+
+for fq in /pipeline/Runs/NextSeq/230912_VH01624_21_AACWVFLM5/ProjectFolders/Project_Jesse-Balic/*/*_R1_001.fastq.gz
+do
+sbatch scripts/alignHg38.sbatch $fq
+done
+
+module load multiqc/1.8
+multiqc .
+```
+
+# get bam stats for spike in and samples
+```{bash}
+module load samtools/1.4.1
+
+for bam in alignment/*sort.dedup.Dm.bam
+do
+echo $bam >> alignment/DmBamFlagstat.txt
+samtools flagstat $bam >> alignment/DmBamFlagstat.txt
+done
+
+# also get stats for human
+for bam in alignment/*sort.bam
+do
+echo $bam >> alignment/BamFlagstat.txt
+samtools flagstat $bam >> alignment/BamFlagstat.txt
+done
+```
+
+# Load R libraries and set paths
+```{r}
+library(data.table)
+library(edgeR)
+library(ggplot2)
+library(Rsubread)
+
+project.dir <- "/dawson_genomics/Projects/CB_ChIP/ChIP_230912"
+align.dir <- file.path(project.dir, "alignment")
+counts.dir <- file.path(project.dir, "counts")
+```
+
+# collate DM counts, use lib sizes to get scale factor for bigwigs
+```{r}
+dm.stat <- read.table(file.path(align.dir, "DmBamFlagstat.txt"), header = FALSE, fill = TRUE)
+dm.files <- dm.stat[grep("Dm.bam", dm.stat$V1), 1]
+dm.reads <- dm.stat[grep("total", t(dm.stat$V5)), 1]
+
+# make text file with bam names and scale factors
+# scale factor for each is 1000000/Dm reads
+bam.sf <- cbind(gsub("sort.dedup.Dm.bam", "sort.dedup.bam", dm.files), 1000000/as.numeric(dm.reads))
+write.table(
+  bam.sf,
+  file.path(align.dir, "bam_sf.txt"),
+  sep = ":",
+  col.names = FALSE,
+  row.names = FALSE,
+  quote = FALSE
+)
+
+# make comparison of spike in v human reads
+hs.stat <- read.table(file.path(align.dir, "BamFlagstat.txt"), header = FALSE, fill = TRUE)
+hs.reads <- hs.stat[grep("total", t(hs.stat$V5)), 1]
+hs.sf <- cbind(bam.sf, dm.reads, 10000000/as.numeric(hs.reads), hs.reads)
+colnames(hs.sf) <- c("Hs.bam", "Dm.scale.factor", "Dm.reads", "Hs.scale.factor", "Hs.reads")
+write.table(
+  hs.sf,
+  file.path(align.dir, "Hs_Dm_sf.txt"),
+  sep = "\t",
+  col.names = TRUE,
+  row.names = FALSE,
+  quote = FALSE
+)
+```
+
+# get gene counts table and normalise by human reads as there was more variability in the spike-in
+```{bash}
+for bam in alignment/*sort.dedup.bam
+do
+sbatch scripts/htseqcounts.sbatch $bam
+done
+```
+
+# load into edgeR save raw counts, get CPMs and save
+```{r}
+# limit to Med samples for now
+counts.files <- list.files(counts.dir, pattern = "MED")
+counts.dge = readDGE(
+  file = counts.files, 
+  path = counts.dir
+  )
+
+# write out raw counts
+write.table(
+  counts.dge$counts, 
+  "results/counts_raw_all.txt",
+  sep = "\t",
+  quote = FALSE, 
+  row.names = TRUE,
+  col.names = NA
+  )
+
+# get cpms & filter out v low/zero counts
+noint <- rownames(counts.dge) %in% c("__no_feature", "__ambiguous", "__too_low_aQual", "__not_aligned", "__alignment_not_unique")
+counts.cpms <- cpm(counts.dge)
+keep <- rowSums(counts.cpms > 1) >= 2 & !noint
+counts.dge <- counts.dge[keep,]
+counts.cpms <- counts.cpms[keep,]
+
+# write out cpms
+write.table(
+  counts.cpms,
+  "results/counts_CPMs_filtered.txt",
+  sep = "\t",
+  quote = FALSE, 
+  row.names = TRUE,
+  col.names = NA
+)
+```
+
+## also norm by spike-in reads for comparison
+#```{r}
+## *****need to properly order spike in scale factors as they are different in bam.sf
+#counts.dm.norm <- counts.dge$counts %*% diag()
+#colnames(counts.dm.norm) <- colnames(counts.dge$counts)
+
+#write.table(
+#  counts.dm.norm,
+#  "results/counts_spikeinnorm_filtered.txt",
+#  sep = "\t",
+#  quote = FALSE, 
+#  row.names = TRUE,
+#  col.names = NA
+#)
+#```
+
+# get top 10000 genes for each group's control (average)
+```{r}
+# get average coverage of controls in each group
+jb.genes <- rowMeans(counts.cpms[, c(1, 5, 11)])
+cb.genes <- rowMeans(counts.cpms[, c(8, 14)])
+
+# sort for greatest avg coverage and only keep top 10000
+jb.genes <- sort(jb.genes, decreasing = TRUE)
+cb.genes <- sort(cb.genes, decreasing = TRUE)
+jb.genes <- jb.genes[1:10000]
+cb.genes <- cb.genes[1:10000]
+```
+
+# get FC of each treatment vs control
+```{r}
+g1.fc <- data.frame(
+  "MED12-CDK8i_v_MED12_FC" = counts.cpms[, 2]/counts.cpms[, 1],
+  "MED12-dTAG_v_MED12_FC" = counts.cpms[, 3]/counts.cpms[, 1],
+  "MED14-CDK8i_v_MED14_FC" = counts.cpms[, 6]/counts.cpms[, 5],
+  "MED14-dTAG_v_MED14_FC" = counts.cpms[, 9]/counts.cpms[, 5],
+  "MED25-CDK8i_v_MED25_FC" = counts.cpms[, 12]/counts.cpms[, 11],
+  "MED25-dTAG_v_MED25_FC" = counts.cpms[, 15]/counts.cpms[, 11]
+  )
+
+g2.fc <- data.frame(
+  "MED14-CDK8i_v_MED14_FC" = counts.cpms[, 7]/counts.cpms[, 8],
+  "MED14-dTAG_v_MED14_FC" = counts.cpms[, 10]/counts.cpms[, 8],
+  "MED25-CDK8i_v_MED25_FC" = counts.cpms[, 13]/counts.cpms[, 14],
+  "MED25-dTAG_v_MED25_FC" = counts.cpms[, 16]/counts.cpms[, 14]
+  )
+
+# limit to top 10000 genes for each group
+g1.fc <- g1.fc[names(jb.genes), ]
+g2.fc <- g2.fc[names(cb.genes), ]
+```
+
+# Charlie also wants to limit to genes with a 30% reduction in PolII in MED14 dTAG v MED14 comp for each group
+```{r}
+g1.fc <- subset(g1.fc, MED14.dTAG_v_MED14_FC <= 0.7)
+g2.fc <- subset(g2.fc, MED14.dTAG_v_MED14_FC <= 0.7)
+```
+
+# make lollipop plots ranked by fc for each comp
+```{r}
+g1.fc$genes <- rownames(g1.fc)
+g2.fc$genes <- rownames(g2.fc)
+
+pdf("plots/lollipop_corr_grid_JBgroup.pdf")
+par(mfrow = c(6, 6))
+for(i in 1:6){
+  g1.fc <- g1.fc[order(g1.fc[, i]), ]
+  g1.fc$genes <- factor(g1.fc$genes, levels = g1.fc$genes)
+  for(j in 1:6){
+    plotcor <- cor.test(g1.fc[, i], g1.fc[, j], method = "spearman")
+    print(ggplot(g1.fc, aes(x = g1.fc$genes, y = g1.fc[, j])) +
+      geom_segment(aes(x = g1.fc$genes, xend = g1.fc$genes, y = 1, yend = g1.fc[, j]), color = "royalblue") +
+      geom_hline(yintercept = 1, color = "red") +
+      geom_point(color="royalblue", size = 1) +
+      theme_bw() +
+      theme(
+        panel.grid = element_blank(),
+        axis.ticks.x = element_blank(),
+        axis.text.x = element_blank()
+      ) +
+      ggtitle(gsub("_", " ", colnames(g1.fc)[j])) +
+      xlab(paste0("rho = ", plotcor$estimate)) +
+      ylab(paste0("FC order ", colnames(g1.fc)[i]))) 
+  }
+}
+dev.off()
+
+pdf("plots/lollipop_corr_grid_CBgroup.pdf")
+par(mfrow = c(4, 4))
+for(i in 1:4){
+  g2.fc <- g2.fc[order(g2.fc[, i]), ]
+  g2.fc$genes <- factor(g2.fc$genes, levels = g2.fc$genes)
+  for(j in 1:4){
+    plotcor <- cor.test(g2.fc[, i], g2.fc[, j], method = "spearman")
+    print(ggplot(g2.fc, aes(x = g2.fc$genes, y = g2.fc[, j])) +
+      geom_segment(aes(x = g2.fc$genes, xend = g2.fc$genes, y = 1, yend = g2.fc[, j]), color = "royalblue") +
+      geom_hline(yintercept = 1, color = "red") +
+      geom_point(color="royalblue", size = 1) +
+      theme_bw() +
+      theme(
+        panel.grid = element_blank(),
+        axis.ticks.x = element_blank(),
+        axis.text.x = element_blank()
+      ) +
+      ggtitle(gsub("_", " ", colnames(g2.fc)[j])) +
+      xlab(paste0("rho = ", plotcor$estimate)) +
+      ylab(paste0("FC order ", colnames(g2.fc)[i]))) 
+  }
+}
+dev.off()
+```
+
+# try making plots with top 5k and top 2k genes as well
+```{r}
+# start with top 5k by expression
+jb.genes <- jb.genes[1:5000]
+cb.genes <- cb.genes[1:5000]
+
+# remake fc tables then limit to top 5000
+g1.fc <- data.frame(
+  "MED12-CDK8i_v_MED12_FC" = counts.cpms[, 2]/counts.cpms[, 1],
+  "MED12-dTAG_v_MED12_FC" = counts.cpms[, 3]/counts.cpms[, 1],
+  "MED14-CDK8i_v_MED14_FC" = counts.cpms[, 6]/counts.cpms[, 5],
+  "MED14-dTAG_v_MED14_FC" = counts.cpms[, 9]/counts.cpms[, 5],
+  "MED25-CDK8i_v_MED25_FC" = counts.cpms[, 12]/counts.cpms[, 11],
+  "MED25-dTAG_v_MED25_FC" = counts.cpms[, 15]/counts.cpms[, 11]
+  )
+
+g2.fc <- data.frame(
+  "MED14-CDK8i_v_MED14_FC" = counts.cpms[, 7]/counts.cpms[, 8],
+  "MED14-dTAG_v_MED14_FC" = counts.cpms[, 10]/counts.cpms[, 8],
+  "MED25-CDK8i_v_MED25_FC" = counts.cpms[, 13]/counts.cpms[, 14],
+  "MED25-dTAG_v_MED25_FC" = counts.cpms[, 16]/counts.cpms[, 14]
+  )
+
+g1.fc <- g1.fc[names(jb.genes), ]
+g2.fc <- g2.fc[names(cb.genes), ]
+
+# now make lollipop plots for these groups
+g1.fc$genes <- rownames(g1.fc)
+g2.fc$genes <- rownames(g2.fc)
+
+pdf("plots/lollipop_corr_grid_JBgroup_5k.pdf")
+par(mfrow = c(6, 6))
+for(i in 1:6){
+  g1.fc <- g1.fc[order(g1.fc[, i]), ]
+  g1.fc$genes <- factor(g1.fc$genes, levels = g1.fc$genes)
+  for(j in 1:6){
+    plotcor <- cor.test(g1.fc[, i], g1.fc[, j], method = "spearman")
+    print(ggplot(g1.fc, aes(x = g1.fc$genes, y = g1.fc[, j])) +
+      geom_segment(aes(x = g1.fc$genes, xend = g1.fc$genes, y = 1, yend = g1.fc[, j]), color = "royalblue") +
+      geom_hline(yintercept = 1, color = "red") +
+      geom_point(color="royalblue", size = 1) +
+      theme_bw() +
+      theme(
+        panel.grid = element_blank(),
+        axis.ticks.x = element_blank(),
+        axis.text.x = element_blank()
+      ) +
+      ggtitle(gsub("_", " ", colnames(g1.fc)[j])) +
+      xlab(paste0("rho = ", plotcor$estimate)) +
+      ylab(paste0("FC order ", colnames(g1.fc)[i]))) 
+  }
+}
+dev.off()
+
+pdf("plots/lollipop_corr_grid_CBgroup_5k.pdf")
+par(mfrow = c(4, 4))
+for(i in 1:4){
+  g2.fc <- g2.fc[order(g2.fc[, i]), ]
+  g2.fc$genes <- factor(g2.fc$genes, levels = g2.fc$genes)
+  for(j in 1:4){
+    plotcor <- cor.test(g2.fc[, i], g2.fc[, j], method = "spearman")
+    print(ggplot(g2.fc, aes(x = g2.fc$genes, y = g2.fc[, j])) +
+      geom_segment(aes(x = g2.fc$genes, xend = g2.fc$genes, y = 1, yend = g2.fc[, j]), color = "royalblue") +
+      geom_hline(yintercept = 1, color = "red") +
+      geom_point(color="royalblue", size = 1) +
+      theme_bw() +
+      theme(
+        panel.grid = element_blank(),
+        axis.ticks.x = element_blank(),
+        axis.text.x = element_blank()
+      ) +
+      ggtitle(gsub("_", " ", colnames(g2.fc)[j])) +
+      xlab(paste0("rho = ", plotcor$estimate)) +
+      ylab(paste0("FC order ", colnames(g2.fc)[i]))) 
+  }
+}
+dev.off()
+```
+
+# now for top 2k
+```{r}
+jb.genes <- jb.genes[1:2000]
+cb.genes <- cb.genes[1:2000]
+
+g1.fc <- g1.fc[names(jb.genes), ]
+g2.fc <- g2.fc[names(cb.genes), ]
+
+pdf("plots/lollipop_corr_grid_JBgroup_2k.pdf")
+par(mfrow = c(6, 6))
+for(i in 1:6){
+  g1.fc <- g1.fc[order(g1.fc[, i]), ]
+  g1.fc$genes <- factor(g1.fc$genes, levels = g1.fc$genes)
+  for(j in 1:6){
+    plotcor <- cor.test(g1.fc[, i], g1.fc[, j], method = "spearman")
+    print(ggplot(g1.fc, aes(x = g1.fc$genes, y = g1.fc[, j])) +
+      geom_segment(aes(x = g1.fc$genes, xend = g1.fc$genes, y = 1, yend = g1.fc[, j]), color = "royalblue") +
+      geom_hline(yintercept = 1, color = "red") +
+      geom_point(color="royalblue", size = 1) +
+      theme_bw() +
+      theme(
+        panel.grid = element_blank(),
+        axis.ticks.x = element_blank(),
+        axis.text.x = element_blank()
+      ) +
+      ggtitle(gsub("_", " ", colnames(g1.fc)[j])) +
+      xlab(paste0("rho = ", plotcor$estimate)) +
+      ylab(paste0("FC order ", colnames(g1.fc)[i]))) 
+  }
+}
+dev.off()
+
+pdf("plots/lollipop_corr_grid_CBgroup_2k.pdf")
+par(mfrow = c(4, 4))
+for(i in 1:4){
+  g2.fc <- g2.fc[order(g2.fc[, i]), ]
+  g2.fc$genes <- factor(g2.fc$genes, levels = g2.fc$genes)
+  for(j in 1:4){
+    plotcor <- cor.test(g2.fc[, i], g2.fc[, j], method = "spearman")
+    print(ggplot(g2.fc, aes(x = g2.fc$genes, y = g2.fc[, j])) +
+      geom_segment(aes(x = g2.fc$genes, xend = g2.fc$genes, y = 1, yend = g2.fc[, j]), color = "royalblue") +
+      geom_hline(yintercept = 1, color = "red") +
+      geom_point(color="royalblue", size = 1) +
+      theme_bw() +
+      theme(
+        panel.grid = element_blank(),
+        axis.ticks.x = element_blank(),
+        axis.text.x = element_blank()
+      ) +
+      ggtitle(gsub("_", " ", colnames(g2.fc)[j])) +
+      xlab(paste0("rho = ", plotcor$estimate)) +
+      ylab(paste0("FC order ", colnames(g2.fc)[i]))) 
+  }
+}
+dev.off()
+```
+
+# also try top 1k for comparison
+```{r}
+jb.genes <- jb.genes[1:1000]
+cb.genes <- cb.genes[1:1000]
+
+g1.fc <- g1.fc[names(jb.genes), ]
+g2.fc <- g2.fc[names(cb.genes), ]
+
+pdf("plots/lollipop_corr_grid_JBgroup_1k.pdf")
+par(mfrow = c(6, 6))
+for(i in 1:6){
+  g1.fc <- g1.fc[order(g1.fc[, i]), ]
+  g1.fc$genes <- factor(g1.fc$genes, levels = g1.fc$genes)
+  for(j in 1:6){
+    plotcor <- cor.test(g1.fc[, i], g1.fc[, j], method = "spearman")
+    print(ggplot(g1.fc, aes(x = g1.fc$genes, y = g1.fc[, j])) +
+      geom_segment(aes(x = g1.fc$genes, xend = g1.fc$genes, y = 1, yend = g1.fc[, j]), color = "royalblue") +
+      geom_hline(yintercept = 1, color = "red") +
+      geom_point(color="royalblue", size = 1) +
+      theme_bw() +
+      theme(
+        panel.grid = element_blank(),
+        axis.ticks.x = element_blank(),
+        axis.text.x = element_blank()
+      ) +
+      ggtitle(gsub("_", " ", colnames(g1.fc)[j])) +
+      xlab(paste0("rho = ", plotcor$estimate)) +
+      ylab(paste0("FC order ", colnames(g1.fc)[i]))) 
+  }
+}
+dev.off()
+
+pdf("plots/lollipop_corr_grid_CBgroup_1k.pdf")
+par(mfrow = c(4, 4))
+for(i in 1:4){
+  g2.fc <- g2.fc[order(g2.fc[, i]), ]
+  g2.fc$genes <- factor(g2.fc$genes, levels = g2.fc$genes)
+  for(j in 1:4){
+    plotcor <- cor.test(g2.fc[, i], g2.fc[, j], method = "spearman")
+    print(ggplot(g2.fc, aes(x = g2.fc$genes, y = g2.fc[, j])) +
+      geom_segment(aes(x = g2.fc$genes, xend = g2.fc$genes, y = 1, yend = g2.fc[, j]), color = "royalblue") +
+      geom_hline(yintercept = 1, color = "red") +
+      geom_point(color="royalblue", size = 1) +
+      theme_bw() +
+      theme(
+        panel.grid = element_blank(),
+        axis.ticks.x = element_blank(),
+        axis.text.x = element_blank()
+      ) +
+      ggtitle(gsub("_", " ", colnames(g2.fc)[j])) +
+      xlab(paste0("rho = ", plotcor$estimate)) +
+      ylab(paste0("FC order ", colnames(g2.fc)[i]))) 
+  }
+}
+dev.off()
+```
+
+# use RPKM normalisation for defining top genes to account for different gene sizes
+```{r}
+# get gene lengths for rpkm calculation
+hg38.bed <- fread("/data/reference/dawson_labs/bed_files/Hg38/Hg38EnsGene.bed")
+
+rpkm.dge = readDGE(
+  file = counts.files, 
+  path = counts.dir
+  )
+
+# these need to have the exacto same genes so only include those in both and order should be the same
+rpkm.dge <- rpkm.dge[which(rownames(rpkm.dge$counts) %in% hg38.bed$V5), ]
+hg38.bed <- hg38.bed[rownames(rpkm.dge$counts), ]
+rpkm.dge <- rpkm.dge[order(rownames(rpkm.dge$counts)), ]
+hg38.bed <- hg38.bed[order(hg38.bed$V5), ]
+
+gene.lengths <- hg38.bed$V3 - hg38.bed$V2
+
+rpkm.counts <- rpkm(rpkm.dge, gene.length = gene.lengths, normalized.lib.sizes = FALSE)
+```
+
+# now make plots as above for 10k, 5k, 2k, 1k and subset 1k and 5k by 30% PolII reduction
+### only worrying about group 1 (JB group) for now as they seem to look better and have additional samples
+```{r}
+counts.dge <- calcNormFactors(counts.dge, method = "TMM")
+tmm.counts <- counts.dge$counts %*% diag(counts.dge$samples$norm.factors)
+colnames(tmm.counts) <- colnames(counts.dge$counts)
+
+# get average coverage in rpkm norm of controls in each group
+jb.genes <- rowMeans(rpkm.counts[, c(1, 5, 11)])
+cb.genes <- rowMeans(rpkm.counts[, c(8, 14)])
+
+# sort for greatest avg coverage and only keep top 10000
+jb.genes <- sort(jb.genes, decreasing = TRUE)
+cb.genes <- sort(cb.genes, decreasing = TRUE)
+jb.genes <- jb.genes[1:10000]
+cb.genes <- cb.genes[1:10000]
+```
+
+# get FC of each treatment vs control
+```{r}
+g1.fc <- data.frame(
+  "MED12-CDK8i_v_MED12_FC" = tmm.counts[, 2]/tmm.counts[, 1],
+  "MED12-dTAG_v_MED12_FC" = tmm.counts[, 3]/tmm.counts[, 1],
+  "MED14-CDK8i_v_MED14_FC" = tmm.counts[, 6]/tmm.counts[, 5],
+  "MED14-dTAG_v_MED14_FC" = tmm.counts[, 9]/tmm.counts[, 5],
+  "MED25-CDK8i_v_MED25_FC" = tmm.counts[, 12]/tmm.counts[, 11],
+  "MED25-dTAG_v_MED25_FC" = tmm.counts[, 15]/tmm.counts[, 11]
+  )
+
+g2.fc <- data.frame(
+  "MED14-CDK8i_v_MED14_FC" = tmm.counts[, 7]/tmm.counts[, 8],
+  "MED14-dTAG_v_MED14_FC" = tmm.counts[, 10]/tmm.counts[, 8],
+  "MED25-CDK8i_v_MED25_FC" = tmm.counts[, 13]/tmm.counts[, 14],
+  "MED25-dTAG_v_MED25_FC" = tmm.counts[, 16]/tmm.counts[, 14]
+  )
+
+# limit to top 10000 genes for each group
+g1.fc <- g1.fc[names(jb.genes), ]
+g2.fc <- g2.fc[names(cb.genes), ]
+
+# make lollipop plots for top 10k
+g1.fc$genes <- rownames(g1.fc)
+
+pdf("plots/lollipop_corr_grid_JBgroup_10k_RPKM_TMM.pdf")
+par(mfrow = c(6, 6))
+for(i in 1:6){
+  g1.fc <- g1.fc[order(g1.fc[, i]), ]
+  g1.fc$genes <- factor(g1.fc$genes, levels = g1.fc$genes)
+  for(j in 1:6){
+    plotcor <- cor.test(g1.fc[, i], g1.fc[, j], method = "spearman")
+    print(ggplot(g1.fc, aes(x = g1.fc$genes, y = g1.fc[, j])) +
+      geom_segment(aes(x = g1.fc$genes, xend = g1.fc$genes, y = 1, yend = g1.fc[, j]), color = "royalblue") +
+      geom_hline(yintercept = 1, color = "red") +
+      geom_point(color="royalblue", size = 1) +
+      theme_bw() +
+      theme(
+        panel.grid = element_blank(),
+        axis.ticks.x = element_blank(),
+        axis.text.x = element_blank()
+      ) +
+      ggtitle(gsub("_", " ", colnames(g1.fc)[j])) +
+      xlab(paste0("rho = ", plotcor$estimate)) +
+      ylab(paste0("FC order ", colnames(g1.fc)[i]))) 
+  }
+}
+dev.off()
+
+pdf("plots/Corr_grid_JBgroup_10k_RPKM_TMM.pdf")
+for(i in 1:6){
+  for(j in 1:6){
+    plotcor <- cor.test(g1.fc[, i], g1.fc[, j], method = "spearman")
+    plot(
+      g1.fc[, i], 
+      g1.fc[, j], 
+      main = paste0("rho: ", round(plotcor$estimate, 2)),
+      xlab = colnames(g1.fc)[i],
+      ylab = colnames(g1.fc)[j]
+      )
+  }
+}
+dev.off()
+
+
+# now for 5k
+jb.genes <- jb.genes[1:5000]
+cb.genes <- cb.genes[1:5000]
+g1.fc <- g1.fc[names(jb.genes), ]
+g2.fc <- g2.fc[names(cb.genes), ]
+
+pdf("plots/lollipop_corr_grid_JBgroup_5k_RPKM_TMM.pdf")
+par(mfrow = c(6, 6))
+for(i in 1:6){
+  g1.fc <- g1.fc[order(g1.fc[, i]), ]
+  g1.fc$genes <- factor(g1.fc$genes, levels = g1.fc$genes)
+  for(j in 1:6){
+    plotcor <- cor.test(g1.fc[, i], g1.fc[, j], method = "spearman")
+    print(ggplot(g1.fc, aes(x = g1.fc$genes, y = g1.fc[, j])) +
+      geom_segment(aes(x = g1.fc$genes, xend = g1.fc$genes, y = 1, yend = g1.fc[, j]), color = "royalblue") +
+      geom_hline(yintercept = 1, color = "red") +
+      geom_point(color="royalblue", size = 1) +
+      theme_bw() +
+      theme(
+        panel.grid = element_blank(),
+        axis.ticks.x = element_blank(),
+        axis.text.x = element_blank()
+      ) +
+      ggtitle(gsub("_", " ", colnames(g1.fc)[j])) +
+      xlab(paste0("rho = ", plotcor$estimate)) +
+      ylab(paste0("FC order ", colnames(g1.fc)[i]))) 
+  }
+}
+dev.off()
+
+pdf("plots/Corr_grid_JBgroup_5k_RPKM_TMM.pdf")
+for(i in 1:6){
+  for(j in 1:6){
+    plotcor <- cor.test(g1.fc[, i], g1.fc[, j], method = "spearman")
+    plot(
+      g1.fc[, i], 
+      g1.fc[, j], 
+      main = paste0("rho: ", round(plotcor$estimate, 2)),
+      xlab = colnames(g1.fc)[i],
+      ylab = colnames(g1.fc)[j]
+      )
+  }
+}
+dev.off()
+
+# now for 2k
+jb.genes <- jb.genes[1:2000]
+cb.genes <- cb.genes[1:2000]
+g1.fc <- g1.fc[names(jb.genes), ]
+g2.fc <- g2.fc[names(cb.genes), ]
+
+pdf("plots/lollipop_corr_grid_JBgroup_2k_RPKM_TMM.pdf")
+par(mfrow = c(6, 6))
+for(i in 1:6){
+  g1.fc <- g1.fc[order(g1.fc[, i]), ]
+  g1.fc$genes <- factor(g1.fc$genes, levels = g1.fc$genes)
+  for(j in 1:6){
+    plotcor <- cor.test(g1.fc[, i], g1.fc[, j], method = "spearman")
+    print(ggplot(g1.fc, aes(x = g1.fc$genes, y = g1.fc[, j])) +
+      geom_segment(aes(x = g1.fc$genes, xend = g1.fc$genes, y = 1, yend = g1.fc[, j]), color = "royalblue") +
+      geom_hline(yintercept = 1, color = "red") +
+      geom_point(color="royalblue", size = 1) +
+      theme_bw() +
+      theme(
+        panel.grid = element_blank(),
+        axis.ticks.x = element_blank(),
+        axis.text.x = element_blank()
+      ) +
+      ggtitle(gsub("_", " ", colnames(g1.fc)[j])) +
+      xlab(paste0("rho = ", plotcor$estimate)) +
+      ylab(paste0("FC order ", colnames(g1.fc)[i]))) 
+  }
+}
+dev.off()
+
+pdf("plots/Corr_grid_JBgroup_2k_RPKM_TMM.pdf")
+for(i in 1:6){
+  for(j in 1:6){
+    plotcor <- cor.test(g1.fc[, i], g1.fc[, j], method = "spearman")
+    plot(
+      g1.fc[, i], 
+      g1.fc[, j], 
+      main = paste0("rho: ", round(plotcor$estimate, 2)),
+      xlab = colnames(g1.fc)[i],
+      ylab = colnames(g1.fc)[j]
+      )
+  }
+}
+dev.off()
+
+# and for 1k
+jb.genes <- jb.genes[1:1000]
+cb.genes <- cb.genes[1:1000]
+g1.fc <- g1.fc[names(jb.genes), ]
+g2.fc <- g2.fc[names(cb.genes), ]
+
+pdf("plots/lollipop_corr_grid_JBgroup_1k_RPKM_TMM.pdf")
+par(mfrow = c(6, 6))
+for(i in 1:6){
+  g1.fc <- g1.fc[order(g1.fc[, i]), ]
+  g1.fc$genes <- factor(g1.fc$genes, levels = g1.fc$genes)
+  for(j in 1:6){
+    plotcor <- cor.test(g1.fc[, i], g1.fc[, j], method = "spearman")
+    print(ggplot(g1.fc, aes(x = g1.fc$genes, y = g1.fc[, j])) +
+      geom_segment(aes(x = g1.fc$genes, xend = g1.fc$genes, y = 1, yend = g1.fc[, j]), color = "royalblue") +
+      geom_hline(yintercept = 1, color = "red") +
+      geom_point(color="royalblue", size = 1) +
+      theme_bw() +
+      theme(
+        panel.grid = element_blank(),
+        axis.ticks.x = element_blank(),
+        axis.text.x = element_blank()
+      ) +
+      ggtitle(gsub("_", " ", colnames(g1.fc)[j])) +
+      xlab(paste0("rho = ", plotcor$estimate)) +
+      ylab(paste0("FC order ", colnames(g1.fc)[i]))) 
+  }
+}
+dev.off()
+
+pdf("plots/Corr_grid_JBgroup_1k_RPKM_TMM.pdf")
+for(i in 1:6){
+  for(j in 1:6){
+    plotcor <- cor.test(g1.fc[, i], g1.fc[, j], method = "spearman")
+    plot(
+      g1.fc[, i], 
+      g1.fc[, j], 
+      main = paste0("rho: ", round(plotcor$estimate, 2)),
+      xlab = colnames(g1.fc)[i],
+      ylab = colnames(g1.fc)[j]
+      )
+  }
+}
+dev.off()
+```
+
+# Charlie also wants to limit to genes with a 30% reduction in PolII in MED14 dTAG v MED14 comp (both top 10k and 5k)
+```{r}
+# remake gene list for top 10k and fc tables 
+jb.genes <- rowMeans(rpkm.counts[, c(1, 5, 11)])
+cb.genes <- rowMeans(rpkm.counts[, c(8, 14)])
+
+jb.genes <- sort(jb.genes, decreasing = TRUE)
+cb.genes <- sort(cb.genes, decreasing = TRUE)
+
+jb.genes <- jb.genes[1:10000]
+cb.genes <- cb.genes[1:10000]
+
+g1.fc <- data.frame(
+  "MED12-CDK8i_v_MED12_FC" = tmm.counts[, 2]/tmm.counts[, 1],
+  "MED12-dTAG_v_MED12_FC" = tmm.counts[, 3]/tmm.counts[, 1],
+  "MED14-CDK8i_v_MED14_FC" = tmm.counts[, 6]/tmm.counts[, 5],
+  "MED14-dTAG_v_MED14_FC" = tmm.counts[, 9]/tmm.counts[, 5],
+  "MED25-CDK8i_v_MED25_FC" = tmm.counts[, 12]/tmm.counts[, 11],
+  "MED25-dTAG_v_MED25_FC" = tmm.counts[, 15]/tmm.counts[, 11]
+  )
+
+g2.fc <- data.frame(
+  "MED14-CDK8i_v_MED14_FC" = tmm.counts[, 7]/tmm.counts[, 8],
+  "MED14-dTAG_v_MED14_FC" = tmm.counts[, 10]/tmm.counts[, 8],
+  "MED25-CDK8i_v_MED25_FC" = tmm.counts[, 13]/tmm.counts[, 14],
+  "MED25-dTAG_v_MED25_FC" = tmm.counts[, 16]/tmm.counts[, 14]
+  )
+
+# limit to top 10000 genes for each group
+g1.fc <- g1.fc[names(jb.genes), ]
+g2.fc <- g2.fc[names(cb.genes), ]
+
+g1.fc <- subset(g1.fc, MED14.dTAG_v_MED14_FC <= 0.7)
+g2.fc <- subset(g2.fc, MED14.dTAG_v_MED14_FC <= 0.7)
+
+# make lollipop plots for top 10k
+g1.fc$genes <- rownames(g1.fc)
+
+pdf("plots/lollipop_corr_grid_JBgroup_10k_30PolII_RPKM_TMM.pdf")
+par(mfrow = c(6, 6))
+for(i in 1:6){
+  g1.fc <- g1.fc[order(g1.fc[, i]), ]
+  g1.fc$genes <- factor(g1.fc$genes, levels = g1.fc$genes)
+  for(j in 1:6){
+    plotcor <- cor.test(g1.fc[, i], g1.fc[, j], method = "spearman")
+    print(ggplot(g1.fc, aes(x = g1.fc$genes, y = g1.fc[, j])) +
+      geom_segment(aes(x = g1.fc$genes, xend = g1.fc$genes, y = 1, yend = g1.fc[, j]), color = "royalblue") +
+      geom_hline(yintercept = 1, color = "red") +
+      geom_point(color="royalblue", size = 1) +
+      theme_bw() +
+      theme(
+        panel.grid = element_blank(),
+        axis.ticks.x = element_blank(),
+        axis.text.x = element_blank()
+      ) +
+      ggtitle(gsub("_", " ", colnames(g1.fc)[j])) +
+      xlab(paste0("rho = ", plotcor$estimate)) +
+      ylab(paste0("FC order ", colnames(g1.fc)[i]))) 
+  }
+}
+dev.off()
+
+pdf("plots/Corr_grid_JBgroup_10k_30PolII_RPKM_TMM.pdf")
+for(i in 1:6){
+  for(j in 1:6){
+    plotcor <- cor.test(g1.fc[, i], g1.fc[, j], method = "spearman")
+    plot(
+      g1.fc[, i], 
+      g1.fc[, j], 
+      main = paste0("rho: ", round(plotcor$estimate, 2)),
+      xlab = colnames(g1.fc)[i],
+      ylab = colnames(g1.fc)[j]
+      )
+  }
+}
+dev.off()
+
+# not top 5k
+jb.genes <- jb.genes[1:5000]
+cb.genes <- cb.genes[1:5000]
+
+g1.fc <- data.frame(
+  "MED12-CDK8i_v_MED12_FC" = tmm.counts[, 2]/tmm.counts[, 1],
+  "MED12-dTAG_v_MED12_FC" = tmm.counts[, 3]/tmm.counts[, 1],
+  "MED14-CDK8i_v_MED14_FC" = tmm.counts[, 6]/tmm.counts[, 5],
+  "MED14-dTAG_v_MED14_FC" = tmm.counts[, 9]/tmm.counts[, 5],
+  "MED25-CDK8i_v_MED25_FC" = tmm.counts[, 12]/tmm.counts[, 11],
+  "MED25-dTAG_v_MED25_FC" = tmm.counts[, 15]/tmm.counts[, 11]
+  )
+
+g2.fc <- data.frame(
+  "MED14-CDK8i_v_MED14_FC" = tmm.counts[, 7]/tmm.counts[, 8],
+  "MED14-dTAG_v_MED14_FC" = tmm.counts[, 10]/tmm.counts[, 8],
+  "MED25-CDK8i_v_MED25_FC" = tmm.counts[, 13]/tmm.counts[, 14],
+  "MED25-dTAG_v_MED25_FC" = tmm.counts[, 16]/tmm.counts[, 14]
+  )
+
+# limit to top 10000 genes for each group
+g1.fc <- g1.fc[names(jb.genes), ]
+g2.fc <- g2.fc[names(cb.genes), ]
+
+g1.fc <- subset(g1.fc, MED14.dTAG_v_MED14_FC <= 0.7)
+g2.fc <- subset(g2.fc, MED14.dTAG_v_MED14_FC <= 0.7)
+
+# make lollipop plots for top 5k
+g1.fc$genes <- rownames(g1.fc)
+
+pdf("plots/lollipop_corr_grid_JBgroup_5k_30PolII_RPKM_TMM.pdf")
+par(mfrow = c(6, 6))
+for(i in 1:6){
+  g1.fc <- g1.fc[order(g1.fc[, i]), ]
+  g1.fc$genes <- factor(g1.fc$genes, levels = g1.fc$genes)
+  for(j in 1:6){
+    plotcor <- cor.test(g1.fc[, i], g1.fc[, j], method = "spearman")
+    print(ggplot(g1.fc, aes(x = g1.fc$genes, y = g1.fc[, j])) +
+      geom_segment(aes(x = g1.fc$genes, xend = g1.fc$genes, y = 1, yend = g1.fc[, j]), color = "royalblue") +
+      geom_hline(yintercept = 1, color = "red") +
+      geom_point(color="royalblue", size = 1) +
+      theme_bw() +
+      theme(
+        panel.grid = element_blank(),
+        axis.ticks.x = element_blank(),
+        axis.text.x = element_blank()
+      ) +
+      ggtitle(gsub("_", " ", colnames(g1.fc)[j])) +
+      xlab(paste0("rho = ", plotcor$estimate)) +
+      ylab(paste0("FC order ", colnames(g1.fc)[i]))) 
+  }
+}
+dev.off()
+
+pdf("plots/Corr_grid_JBgroup_5k_30PolII_RPKM_TMM.pdf")
+for(i in 1:6){
+  for(j in 1:6){
+    plotcor <- cor.test(g1.fc[, i], g1.fc[, j], method = "spearman")
+    plot(
+      g1.fc[, i], 
+      g1.fc[, j], 
+      main = paste0("rho: ", round(plotcor$estimate, 2)),
+      xlab = colnames(g1.fc)[i],
+      ylab = colnames(g1.fc)[j]
+      )
+  }
+}
+dev.off()
+```
+
+# original analysis using CPMs for gene list was better, so redo lollipop plots with constant y-axis and do corrplots for all thresholds using CPM-based gene lists
+# start with top 10000 genes 
+### replotting correlation plots with pearson's rho and lm line
+```{r}
+# get average coverage of controls in each group
+jb.genes <- rowMeans(counts.cpms[, c(1, 5, 11)])
+
+# sort for greatest avg coverage and only keep top 10000
+jb.genes <- sort(jb.genes, decreasing = TRUE)
+jb.genes <- jb.genes[1:10000]
+```
+
+# get FC of each treatment vs control
+```{r}
+g1.fc <- data.frame(
+  "MED12-CDK8i_v_MED12_FC" = counts.cpms[, 2]/counts.cpms[, 1],
+  "MED12-dTAG_v_MED12_FC" = counts.cpms[, 3]/counts.cpms[, 1],
+  "MED14-CDK8i_v_MED14_FC" = counts.cpms[, 6]/counts.cpms[, 5],
+  "MED14-dTAG_v_MED14_FC" = counts.cpms[, 9]/counts.cpms[, 5],
+  "MED25-CDK8i_v_MED25_FC" = counts.cpms[, 12]/counts.cpms[, 11],
+  "MED25-dTAG_v_MED25_FC" = counts.cpms[, 15]/counts.cpms[, 11]
+  )
+
+# limit to top 10000 genes for each group
+g1.fc <- g1.fc[names(jb.genes), ]
+```
+
+```{r}
+# make lollipop plots for top 10k
+g1.fc$genes <- rownames(g1.fc)
+
+pdf("plots/lollipop_corr_grid_JBgroup_10k_CPM.pdf")
+par(mfrow = c(6, 6))
+for(i in 1:6){
+  g1.fc <- g1.fc[order(g1.fc[, i]), ]
+  g1.fc$genes <- factor(g1.fc$genes, levels = g1.fc$genes)
+  for(j in 1:6){
+    plotcor <- cor.test(g1.fc[, i], g1.fc[, j], method = "spearman")
+    print(ggplot(g1.fc, aes(x = g1.fc$genes, y = g1.fc[, j])) +
+      geom_segment(aes(x = g1.fc$genes, xend = g1.fc$genes, y = 1, yend = g1.fc[, j]), color = "royalblue") +
+      geom_hline(yintercept = 1, color = "red") +
+      geom_point(color="royalblue", size = 1) +
+      theme_bw() +
+      theme(
+        panel.grid = element_blank(),
+        axis.ticks.x = element_blank(),
+        axis.text.x = element_blank()
+      ) +
+      ggtitle(gsub("_", " ", colnames(g1.fc)[j])) +
+      xlab(paste0("rho = ", plotcor$estimate)) +
+      ylab(paste0("FC order ", colnames(g1.fc)[i])) +
+      coord_cartesian(ylim = c(0, 1.4)))
+  }
+}
+dev.off()
+
+pdf("plots/Corr_grid_JBgroup_10k_CPM.pdf")
+for(i in 1:6){
+  for(j in 1:6){
+    plotcor <- cor.test(g1.fc[, i], g1.fc[, j], method = "pearson")
+    plot(
+      g1.fc[, i], 
+      g1.fc[, j], 
+      main = paste0("rho: ", round(plotcor$estimate, 2)),
+      xlab = colnames(g1.fc)[i],
+      ylab = colnames(g1.fc)[j],
+      xlim = c(0, 2.5),
+      ylim = c(0, 2.5)
+      )
+    abline(lm(g1.fc[, j] ~ g1.fc[, i]), col = "red")
+#    lines(lowess(g1.fc[, i], g1.fc[, j]), col = "red")
+  }
+}
+dev.off()
+
+
+# now for 5k
+jb.genes <- jb.genes[1:5000]
+g1.fc <- g1.fc[names(jb.genes), ]
+
+pdf("plots/lollipop_corr_grid_JBgroup_5k_CPM.pdf")
+par(mfrow = c(6, 6))
+for(i in 1:6){
+  g1.fc <- g1.fc[order(g1.fc[, i]), ]
+  g1.fc$genes <- factor(g1.fc$genes, levels = g1.fc$genes)
+  for(j in 1:6){
+    plotcor <- cor.test(g1.fc[, i], g1.fc[, j], method = "spearman")
+    print(ggplot(g1.fc, aes(x = g1.fc$genes, y = g1.fc[, j])) +
+      geom_segment(aes(x = g1.fc$genes, xend = g1.fc$genes, y = 1, yend = g1.fc[, j]), color = "royalblue") +
+      geom_hline(yintercept = 1, color = "red") +
+      geom_point(color="royalblue", size = 1) +
+      theme_bw() +
+      theme(
+        panel.grid = element_blank(),
+        axis.ticks.x = element_blank(),
+        axis.text.x = element_blank()
+      ) +
+      ggtitle(gsub("_", " ", colnames(g1.fc)[j])) +
+      xlab(paste0("rho = ", plotcor$estimate)) +
+      ylab(paste0("FC order ", colnames(g1.fc)[i])) +
+      coord_cartesian(ylim = c(0, 1.4))) 
+  }
+}
+dev.off()
+
+pdf("plots/Corr_grid_JBgroup_5k_CPM.pdf")
+for(i in 1:6){
+  for(j in 1:6){
+    plotcor <- cor.test(g1.fc[, i], g1.fc[, j], method = "pearson")
+    plot(
+      g1.fc[, i], 
+      g1.fc[, j], 
+      main = paste0("rho: ", round(plotcor$estimate, 2)),
+      xlab = colnames(g1.fc)[i],
+      ylab = colnames(g1.fc)[j],
+      xlim = c(0, 2),
+      ylim = c(0, 2)
+      )
+    abline(lm(g1.fc[, j] ~ g1.fc[, i]), col = "red")
+#    lines(lowess(g1.fc[, i], g1.fc[, j]), col = "red")
+  }
+}
+dev.off()
+
+# now for 2k
+jb.genes <- jb.genes[1:2000]
+g1.fc <- g1.fc[names(jb.genes), ]
+
+pdf("plots/lollipop_corr_grid_JBgroup_2k_CPM.pdf")
+par(mfrow = c(6, 6))
+for(i in 1:6){
+  g1.fc <- g1.fc[order(g1.fc[, i]), ]
+  g1.fc$genes <- factor(g1.fc$genes, levels = g1.fc$genes)
+  for(j in 1:6){
+    plotcor <- cor.test(g1.fc[, i], g1.fc[, j], method = "spearman")
+    print(ggplot(g1.fc, aes(x = g1.fc$genes, y = g1.fc[, j])) +
+      geom_segment(aes(x = g1.fc$genes, xend = g1.fc$genes, y = 1, yend = g1.fc[, j]), color = "royalblue") +
+      geom_hline(yintercept = 1, color = "red") +
+      geom_point(color="royalblue", size = 1) +
+      theme_bw() +
+      theme(
+        panel.grid = element_blank(),
+        axis.ticks.x = element_blank(),
+        axis.text.x = element_blank()
+      ) +
+      ggtitle(gsub("_", " ", colnames(g1.fc)[j])) +
+      xlab(paste0("rho = ", plotcor$estimate)) +
+      ylab(paste0("FC order ", colnames(g1.fc)[i])) +
+      coord_cartesian(ylim = c(0, 1.4)))  
+  }
+}
+dev.off()
+
+pdf("plots/Corr_grid_JBgroup_2k_CPM.pdf")
+for(i in 1:6){
+  for(j in 1:6){
+    plotcor <- cor.test(g1.fc[, i], g1.fc[, j], method = "pearson")
+    plot(
+      g1.fc[, i], 
+      g1.fc[, j], 
+      main = paste0("rho: ", round(plotcor$estimate, 2)),
+      xlab = colnames(g1.fc)[i],
+      ylab = colnames(g1.fc)[j],
+      xlim = c(0, 1.5),
+      ylim = c(0, 1.5)
+      )
+    abline(lm(g1.fc[, j] ~ g1.fc[, i]), col = "red")
+#    lines(lowess(g1.fc[, i], g1.fc[, j]), col = "red")
+  }
+}
+dev.off()
+
+# and for 1k
+jb.genes <- jb.genes[1:1000]
+g1.fc <- g1.fc[names(jb.genes), ]
+
+pdf("plots/lollipop_corr_grid_JBgroup_1k_CPM.pdf")
+par(mfrow = c(6, 6))
+for(i in 1:6){
+  g1.fc <- g1.fc[order(g1.fc[, i]), ]
+  g1.fc$genes <- factor(g1.fc$genes, levels = g1.fc$genes)
+  for(j in 1:6){
+    plotcor <- cor.test(g1.fc[, i], g1.fc[, j], method = "spearman")
+    print(ggplot(g1.fc, aes(x = g1.fc$genes, y = g1.fc[, j])) +
+      geom_segment(aes(x = g1.fc$genes, xend = g1.fc$genes, y = 1, yend = g1.fc[, j]), color = "royalblue") +
+      geom_hline(yintercept = 1, color = "red") +
+      geom_point(color="royalblue", size = 1) +
+      theme_bw() +
+      theme(
+        panel.grid = element_blank(),
+        axis.ticks.x = element_blank(),
+        axis.text.x = element_blank()
+      ) +
+      ggtitle(gsub("_", " ", colnames(g1.fc)[j])) +
+      xlab(paste0("rho = ", plotcor$estimate)) +
+      ylab(paste0("FC order ", colnames(g1.fc)[i])) +
+      coord_cartesian(ylim = c(0, 1.4)))  
+  }
+}
+dev.off()
+
+pdf("plots/Corr_grid_JBgroup_1k_CPM.pdf")
+for(i in 1:6){
+  for(j in 1:6){
+    plotcor <- cor.test(g1.fc[, i], g1.fc[, j], method = "pearson")
+    plot(
+      g1.fc[, i], 
+      g1.fc[, j], 
+      main = paste0("rho: ", round(plotcor$estimate, 2)),
+      xlab = colnames(g1.fc)[i],
+      ylab = colnames(g1.fc)[j],
+      xlim = c(0, 1.5),
+      ylim = c(0, 1.5)
+      )
+    abline(lm(g1.fc[, j] ~ g1.fc[, i]), col = "red")
+#    lines(lowess(g1.fc[, i], g1.fc[, j]), col = "red")
+  }
+}
+dev.off()
+```
+
+# Charlie also wants to limit to genes with a 30% reduction in PolII in MED14 dTAG v MED14 comp (both top 10k and 5k)
+```{r}
+# remake gene list for top 10k and fc tables
+jb.genes <- rowMeans(counts.cpms[, c(1, 5, 11)])
+
+# sort for greatest avg coverage and only keep top 10000
+jb.genes <- sort(jb.genes, decreasing = TRUE)
+jb.genes <- jb.genes[1:10000]
+
+g1.fc <- data.frame(
+  "MED12-CDK8i_v_MED12_FC" = counts.cpms[, 2]/counts.cpms[, 1],
+  "MED12-dTAG_v_MED12_FC" = counts.cpms[, 3]/counts.cpms[, 1],
+  "MED14-CDK8i_v_MED14_FC" = counts.cpms[, 6]/counts.cpms[, 5],
+  "MED14-dTAG_v_MED14_FC" = counts.cpms[, 9]/counts.cpms[, 5],
+  "MED25-CDK8i_v_MED25_FC" = counts.cpms[, 12]/counts.cpms[, 11],
+  "MED25-dTAG_v_MED25_FC" = counts.cpms[, 15]/counts.cpms[, 11]
+  )
+
+# limit to top 10000 genes for each group
+g1.fc <- g1.fc[names(jb.genes), ]
+
+g1.fc <- subset(g1.fc, MED14.dTAG_v_MED14_FC <= 0.7)
+
+# make lollipop plots for top 10k
+g1.fc$genes <- rownames(g1.fc)
+
+pdf("plots/lollipop_corr_grid_JBgroup_10k_30PolII_CPM.pdf")
+par(mfrow = c(6, 6))
+for(i in 1:6){
+  g1.fc <- g1.fc[order(g1.fc[, i]), ]
+  g1.fc$genes <- factor(g1.fc$genes, levels = g1.fc$genes)
+  for(j in 1:6){
+    plotcor <- cor.test(g1.fc[, i], g1.fc[, j], method = "spearman")
+    print(ggplot(g1.fc, aes(x = g1.fc$genes, y = g1.fc[, j])) +
+      geom_segment(aes(x = g1.fc$genes, xend = g1.fc$genes, y = 1, yend = g1.fc[, j]), color = "royalblue") +
+      geom_hline(yintercept = 1, color = "red") +
+      geom_point(color="royalblue", size = 1) +
+      theme_bw() +
+      theme(
+        panel.grid = element_blank(),
+        axis.ticks.x = element_blank(),
+        axis.text.x = element_blank()
+      ) +
+      ggtitle(gsub("_", " ", colnames(g1.fc)[j])) +
+      xlab(paste0("rho = ", plotcor$estimate)) +
+      ylab(paste0("FC order ", colnames(g1.fc)[i])) +
+      coord_cartesian(ylim = c(0, 1.4)))  
+  }
+}
+dev.off()
+
+pdf("plots/Corr_grid_JBgroup_10k_30PolII_CPM.pdf")
+for(i in 1:6){
+  for(j in 1:6){
+    plotcor <- cor.test(g1.fc[, i], g1.fc[, j], method = "pearson")
+    plot(
+      g1.fc[, i], 
+      g1.fc[, j], 
+      main = paste0("rho: ", round(plotcor$estimate, 2)),
+      xlab = colnames(g1.fc)[i],
+      ylab = colnames(g1.fc)[j],
+      xlim = c(0, 1.5),
+      ylim = c(0, 1.5)
+      )
+    abline(lm(g1.fc[, j] ~ g1.fc[, i]), col = "red")
+#    lines(lowess(g1.fc[, i], g1.fc[, j]), col = "red")
+  }
+}
+dev.off()
+
+# not top 5k
+jb.genes <- jb.genes[1:5000]
+
+g1.fc <- data.frame(
+  "MED12-CDK8i_v_MED12_FC" = tmm.counts[, 2]/tmm.counts[, 1],
+  "MED12-dTAG_v_MED12_FC" = tmm.counts[, 3]/tmm.counts[, 1],
+  "MED14-CDK8i_v_MED14_FC" = tmm.counts[, 6]/tmm.counts[, 5],
+  "MED14-dTAG_v_MED14_FC" = tmm.counts[, 9]/tmm.counts[, 5],
+  "MED25-CDK8i_v_MED25_FC" = tmm.counts[, 12]/tmm.counts[, 11],
+  "MED25-dTAG_v_MED25_FC" = tmm.counts[, 15]/tmm.counts[, 11]
+  )
+
+# limit to top 10000 genes for each group
+g1.fc <- g1.fc[names(jb.genes), ]
+
+g1.fc <- subset(g1.fc, MED14.dTAG_v_MED14_FC <= 0.7)
+
+# make lollipop plots for top 5k
+g1.fc$genes <- rownames(g1.fc)
+
+pdf("plots/lollipop_corr_grid_JBgroup_5k_30PolII_CPM.pdf")
+par(mfrow = c(6, 6))
+for(i in 1:6){
+  g1.fc <- g1.fc[order(g1.fc[, i]), ]
+  g1.fc$genes <- factor(g1.fc$genes, levels = g1.fc$genes)
+  for(j in 1:6){
+    plotcor <- cor.test(g1.fc[, i], g1.fc[, j], method = "spearman")
+    print(ggplot(g1.fc, aes(x = g1.fc$genes, y = g1.fc[, j])) +
+      geom_segment(aes(x = g1.fc$genes, xend = g1.fc$genes, y = 1, yend = g1.fc[, j]), color = "royalblue") +
+      geom_hline(yintercept = 1, color = "red") +
+      geom_point(color="royalblue", size = 1) +
+      theme_bw() +
+      theme(
+        panel.grid = element_blank(),
+        axis.ticks.x = element_blank(),
+        axis.text.x = element_blank()
+      ) +
+      ggtitle(gsub("_", " ", colnames(g1.fc)[j])) +
+      xlab(paste0("rho = ", plotcor$estimate)) +
+      ylab(paste0("FC order ", colnames(g1.fc)[i])) +
+      coord_cartesian(ylim = c(0, 1.4)))
+  }
+}
+dev.off()
+
+pdf("plots/Corr_grid_JBgroup_5k_30PolII_CPM.pdf")
+for(i in 1:6){
+  for(j in 1:6){
+    plotcor <- cor.test(g1.fc[, i], g1.fc[, j], method = "pearson")
+    plot(
+      g1.fc[, i], 
+      g1.fc[, j], 
+      main = paste0("rho: ", round(plotcor$estimate, 2)),
+      xlab = colnames(g1.fc)[i],
+      ylab = colnames(g1.fc)[j],
+      xlim = c(0, 1.5),
+      ylim = c(0, 1.5)
+      )
+    abline(lm(g1.fc[, j] ~ g1.fc[, i]), col = "red")
+#    lines(lowess(g1.fc[, i], g1.fc[, j]), col = "red")
+  }
+}
+dev.off()
+```
+
+# make some avg profile plots with deep tools for integrator chip analysis, start with making bigwigs
+```{bash}
+while read -r line
+do
+IFS=: read -r bam sf <<< $line
+sbatch scripts/DeeptoolsBamCov.sbatch $bam $sf
+done < alignment/bam_sf.txt
+```
+
+# make a bed file from NfKB targets list to make a profile plot
+```{r}
+nfkb <- scan("reference_files/NfKB_targets.csv", what = character())
+dt.bed <- fread("/data/reference/dawson_labs/bed_files/Hg38/Hg38EnsGeneDT.bed", header = FALSE)
+nfkb.dt <- dt.bed[which(dt.bed$V4 %in% nfkb), ]
+
+# save as a bed file for DT
+write.table(
+  nfkb.dt,
+  "reference_files/NfKB_targets_DT.bed",
+  sep = "\t",
+  col.names = FALSE,
+  row.names = FALSE,
+  quote = FALSE
+)
+```
+
+# submit profile plot script
+```{bash}
+sbatch scripts/DTMat_INTS5_NFKB_profile.sbatch
+```
+
+# load counts into edgeR and get FC for INTS5-TNFa vs INTS5-untreated
+```{r}
+# limit to Med samples for now
+ints.files <- list.files(counts.dir, pattern = "INTS5")
+ints.dge = readDGE(
+  file = ints.files, 
+  path = counts.dir
+  )
+
+# get cpms & filter out v low/zero counts
+noint <- rownames(ints.dge) %in% c("__no_feature", "__ambiguous", "__too_low_aQual", "__not_aligned", "__alignment_not_unique")
+ints.cpms <- cpm(ints.dge)
+keep <- rowSums(ints.cpms > 1) >= 2 & !noint
+ints.dge <- ints.dge[keep,]
+ints.cpms <- ints.cpms[keep,]
+
+# TMM noramlise
+ints.dge <- calcNormFactors(ints.dge, method = "TMM")
+tmm.ints <- as.data.frame(ints.dge$counts %*% diag(ints.dge$samples$norm.factors))
+colnames(tmm.ints) <- colnames(ints.dge$counts)
+
+# add column for FC and subset for >2
+tmm.ints$ints.tnfa.fc <- tmm.ints$`INTS5-A2-TNFa_S8`/tmm.ints$`INTS5-A2-untreated_S7`
+tmm.ints <- subset(tmm.ints, ints.tnfa.fc >= 2)
+
+# limit DT bed to subset of genes and write out
+tnfa.dt <- dt.bed[which(dt.bed$V5 %in% rownames(tmm.ints)), ]
+write.table(
+  tnfa.dt,
+  "reference_files/TNFa_FC2_DT.bed",
+  sep = "\t",
+  col.names = FALSE,
+  row.names = FALSE,
+  quote = FALSE
+)
+```
+
+# now submit heatmap job
+```{bash}
+sbatch scripts/DTMat_INTS5_TNFa_FC2_profile.sbatch
+```
+
+# replotting correlation plots for 10k genes list adding genes DE in MED14 dTAG SLAMseq
+```{r}
+# get average coverage of controls in each group
+jb.genes <- rowMeans(counts.cpms[, c(1, 5, 11)])
+
+# sort for greatest avg coverage and only keep top 10000
+jb.genes <- sort(jb.genes, decreasing = TRUE)
+jb.genes <- jb.genes[1:10000]
+```
+
+# get FC of each treatment vs control
+```{r}
+g1.fc <- data.frame(
+  "MED12-CDK8i_v_MED12_FC" = counts.cpms[, 2]/counts.cpms[, 1],
+  "MED12-dTAG_v_MED12_FC" = counts.cpms[, 3]/counts.cpms[, 1],
+  "MED14-CDK8i_v_MED14_FC" = counts.cpms[, 6]/counts.cpms[, 5],
+  "MED14-dTAG_v_MED14_FC" = counts.cpms[, 9]/counts.cpms[, 5],
+  "MED25-CDK8i_v_MED25_FC" = counts.cpms[, 12]/counts.cpms[, 11],
+  "MED25-dTAG_v_MED25_FC" = counts.cpms[, 15]/counts.cpms[, 11]
+  )
+
+# limit to top 10000 genes for each group
+g1.fc <- g1.fc[names(jb.genes), ]
+```
+
+```{r}
+# make lollipop plots for top 10k
+g1.fc$genes <- rownames(g1.fc)
+
+# also subset datasets by SLAMseq up and down genes to label with colours on plots
+tc.up <- scan("reference_files/SLAMseq_TCcounts_MED14_dTAGvDMSO_sigUp_genelist.txt", what = character())
+tc.down <- scan("reference_files/SLAMseq_TCcounts_MED14_dTAGvDMSO_sigDown_genelist.txt", what = character())
+g1.up <- g1.fc[which(g1.fc$genes %in% tc.up), ]
+g1.down <- g1.fc[which(g1.fc$genes %in% tc.down), ]
+
+pdf("plots/Corr_10k_CPM_SLAMseq_TCcounts_MED14dTAG_sig.pdf")
+for(i in 1:6){
+#  g1.fc$genes <- factor(g1.fc$genes, levels = g1.fc$genes)
+  for(j in 1:6){
+    plotcor <- cor.test(g1.fc[, i], g1.fc[, j], method = "pearson")
+    plotlm <- lm(formula = g1.fc[, j] ~ g1.fc[, i])
+    coef <- coefficients(plotlm)
+    print(ggplot(g1.fc, aes(x = g1.fc[, i], y = g1.fc[, j])) +
+    geom_point() + 
+    geom_abline(intercept = coef[1], slope = coef[2], color = "red") + 
+    ggtitle(paste0("r = ", round(plotcor$estimate, 2))) +
+    xlab(colnames(g1.fc)[i]) +
+    ylab(colnames(g1.fc)[j]) +
+    coord_cartesian(ylim = c(0, 2), xlim = c(0, 2)) +
+    theme_bw() +
+    theme(
+      panel.grid = element_blank()
+      ) +
+#    geom_point(data = g1.up, aes(x = g1.up[, i], y = g1.up[, j]), colour = "red") +
+    geom_point(data = g1.down, aes(x = g1.down[, i], y = g1.down[, j]), colour = "blue")
+    )
+  }
+}
+dev.off()
+
+# also subset datasets by SLAMseq up and down genes to label with colours on plots
+tot.up <- scan("reference_files/SLAMseq_counts_MED14_dTAGvDMSO_sigUp_genelist.txt", what = character())
+tot.down <- scan("reference_files/SLAMseq_counts_MED14_dTAGvDMSO_sigDown_genelist.txt", what = character())
+g1.up <- g1.fc[which(g1.fc$genes %in% tot.up), ]
+g1.down <- g1.fc[which(g1.fc$genes %in% tot.down), ]
+
+pdf("plots/Corr_10k_CPM_SLAMseq_counts_MED14dTAG_sig.pdf")
+for(i in 1:6){
+#  g1.fc$genes <- factor(g1.fc$genes, levels = g1.fc$genes)
+  for(j in 1:6){
+    plotcor <- cor.test(g1.fc[, i], g1.fc[, j], method = "pearson")
+    plotlm <- lm(formula = g1.fc[, j] ~ g1.fc[, i])
+    coef <- coefficients(plotlm)
+    print(ggplot(g1.fc, aes(x = g1.fc[, i], y = g1.fc[, j])) +
+    geom_point() + 
+    geom_abline(intercept = coef[1], slope = coef[2], color = "red") + 
+    ggtitle(paste0("r = ", round(plotcor$estimate, 2))) +
+    xlab(colnames(g1.fc)[i]) +
+    ylab(colnames(g1.fc)[j]) +
+    coord_cartesian(ylim = c(0, 2), xlim = c(0, 2)) +
+    theme_bw() +
+    theme(
+      panel.grid = element_blank()
+      ) +
+#    geom_point(data = g1.up, aes(x = g1.up[, i], y = g1.up[, j]), colour = "red") +
+    geom_point(data = g1.down, aes(x = g1.down[, i], y = g1.down[, j]), colour = "blue")
+    )
+  }
+}
+dev.off()
+```
+
+# write out MED14 dTAG FC to compare with SLAMseq
+```{r}
+med14.fc <- counts.cpms[, 9]/counts.cpms[, 5]
+write.table(
+  med14.fc,
+  "reference_files/Pol2ChIP_MED14dTAGvDMSO_FC.txt",
+  sep = "\t",
+  col.names = FALSE,
+  row.names = TRUE,
+  quote = FALSE
+)
+```
+
+# make violin plots of LFC at all gene and at only sig down in SLAM T>C counts
+```{r}
+# firs remake fc table with all genes
+g1.fc <- data.frame(
+  "MED12-CDK8i_v_MED12_FC" = counts.cpms[, 2]/counts.cpms[, 1],
+  "MED12-dTAG_v_MED12_FC" = counts.cpms[, 3]/counts.cpms[, 1],
+  "MED14-CDK8i_v_MED14_FC" = counts.cpms[, 6]/counts.cpms[, 5],
+  "MED14-dTAG_v_MED14_FC" = counts.cpms[, 9]/counts.cpms[, 5],
+  "MED25-CDK8i_v_MED25_FC" = counts.cpms[, 12]/counts.cpms[, 11],
+  "MED25-dTAG_v_MED25_FC" = counts.cpms[, 15]/counts.cpms[, 11]
+  )
+
+vio.data <- data.frame()
+for(k in c(2:4, 6)){
+  tot.lfc <- g1.fc[, k]
+  comp.vio <- cbind(rep(colnames(g1.fc)[k], length(tot.lfc)), tot.lfc)
+  vio.data <- rbind(vio.data, comp.vio)
+}
+colnames(vio.data) <- c("comparison", "LFC")
+vio.data$LFC <- as.numeric(vio.data$LFC)
+
+pdf("plots/violin_ChIP_FC_all_genes.pdf")
+  ggplot(vio.data, aes(x = comparison, y = LFC, fill = comparison)) + 
+    geom_violin() +
+    theme_bw() +
+    geom_hline(yintercept = 1, color = "black") +
+    coord_cartesian(ylim = c(0, 3)) +
+    theme(
+      panel.grid = element_blank(),
+      axis.ticks.x = element_blank(),
+      axis.text.x = element_blank(),
+      axis.title.x = element_blank()
+    )
+dev.off()
+
+vio.data <- data.frame()
+for(k in c(2:4, 6)){
+  m14.lfc <- g1.fc[which(rownames(g1.fc) %in% tc.down), k]
+  comp.vio <- cbind(rep(colnames(g1.fc)[k], length(m14.lfc)), m14.lfc)
+  vio.data <- rbind(vio.data, comp.vio)
+}
+colnames(vio.data) <- c("comparison", "LFC")
+vio.data$LFC <- as.numeric(vio.data$LFC)
+
+pdf("plots/violin_ChIP_FC_MED14down.pdf")
+  ggplot(vio.data, aes(x = comparison, y = LFC, fill = comparison)) + 
+    geom_violin() +
+    theme_bw() +
+    geom_hline(yintercept = 1, color = "black") +
+    coord_cartesian(ylim = c(0, 3)) +
+    theme(
+      panel.grid = element_blank(),
+      axis.ticks.x = element_blank(),
+      axis.text.x = element_blank(),
+      axis.title.x = element_blank()
+    )
+dev.off()
+```
+
+
+# get traveling index and make CDF plot 
+```{r}
+# first make saf of coordinates for genes from nfkb list tss (+/- 2.5kb) and body (2.5k-TSS)
+# need to exclude any < 2.5k
+nfkb.2500 <- nfkb.dt[which((nfkb.dt$V3 - nfkb.dt$V2) > 2500), ]
+nfkb.tss <- data.frame(
+  "GeneID" = nfkb.2500$V4,
+  "Chr" = nfkb.2500$V1,
+  "Start" = nfkb.2500$V2 - 2500, 
+  "End" = nfkb.2500$V2 + 2500,
+  "Strand" = nfkb.2500$V6
+)
+nfkb.body <- data.frame(
+  "GeneID" = nfkb.2500$V4,
+  "Chr" = nfkb.2500$V1,
+  "Start" = nfkb.2500$V2 + 2500, 
+  "End" = nfkb.2500$V3,
+  "Strand" = nfkb.2500$V6
+)
+
+# get counts over regions
+ints.bams <- list.files(align.dir, pattern = "INTS5(\\S)+sort.dedup.bam$", full.names = TRUE)
+tss.counts <- featureCounts(
+  files = ints.bams,
+  annot.ext = nfkb.tss,
+  largestOverlap = TRUE
+)
+body.counts <- featureCounts(
+  files = ints.bams,
+  annot.ext = nfkb.body,
+  largestOverlap = TRUE
+)
+
+# get ratio of TSS/body for each sample, use log scale for readability
+nfkb.tr <- log10(tss.counts$counts/body.counts$counts)
+colnames(nfkb.tr) <- gsub(".sort.dedup.bam", "", colnames(nfkb.tr))
+# remove infinite values
+nfkb.tr <- as.data.frame(nfkb.tr[which(is.finite(nfkb.tr[, 1])),])
+
+# log format for ggplots
+cdf.data <- data.frame()
+for(k in 1:4){
+  s.tr <- nfkb.tr[, k]
+  s.cdf <- cbind(rep(colnames(nfkb.tr)[k], length(s.tr)), s.tr)
+  cdf.data <- rbind(cdf.data, s.cdf)
+}
+colnames(cdf.data) <- c("sample", "logTR")
+cdf.data$logTR <- as.numeric(cdf.data$logTR)
+
+# make CDF plots
+pdf("plots/CDF_travelling_ratio.pdf")
+  ggplot(cdf.data, aes(logTR, colour = sample)) +
+    stat_ecdf() +
+    theme_bw() +
+    theme(panel.grid = element_blank()) +
+    ggtitle("Cumulative distribution of travelling ratio") +
+    xlab("log(travelling ratio)") +
+    ylab("proportion")
+dev.off()
+```
+
+# try again with TSS as -30/+300
+```{r}
+nfkb.tss <- data.frame(
+  "GeneID" = nfkb.2500$V4,
+  "Chr" = nfkb.2500$V1,
+  "Start" = nfkb.2500$V2 - 30, 
+  "End" = nfkb.2500$V2 + 300,
+  "Strand" = nfkb.2500$V6
+)
+nfkb.body <- data.frame(
+  "GeneID" = nfkb.2500$V4,
+  "Chr" = nfkb.2500$V1,
+  "Start" = nfkb.2500$V2 + 300, 
+  "End" = nfkb.2500$V3,
+  "Strand" = nfkb.2500$V6
+)
+
+# get counts over regions
+tss.counts <- featureCounts(
+  files = ints.bams,
+  annot.ext = nfkb.tss,
+  largestOverlap = TRUE
+)
+body.counts <- featureCounts(
+  files = ints.bams,
+  annot.ext = nfkb.body,
+  largestOverlap = TRUE
+)
+
+# get ratio of TSS/body for each sample, use log scale for readability
+nfkb.tr <- log10(tss.counts$counts/body.counts$counts)
+colnames(nfkb.tr) <- gsub(".sort.dedup.bam", "", colnames(nfkb.tr))
+# remove infinite values
+nfkb.tr <- as.data.frame(nfkb.tr[which(is.finite(nfkb.tr[, 1])),])
+
+# log format for ggplots
+cdf.data <- data.frame()
+for(k in 1:4){
+  s.tr <- nfkb.tr[, k]
+  s.cdf <- cbind(rep(colnames(nfkb.tr)[k], length(s.tr)), s.tr)
+  cdf.data <- rbind(cdf.data, s.cdf)
+}
+colnames(cdf.data) <- c("sample", "logTR")
+cdf.data$logTR <- as.numeric(cdf.data$logTR)
+
+# make CDF plots
+pdf("plots/CDF_travelling_ratio_30_300.pdf")
+  ggplot(cdf.data, aes(logTR, colour = sample)) +
+    stat_ecdf() +
+    theme_bw() +
+    theme(panel.grid = element_blank()) +
+    ggtitle("Cumulative distribution of travelling ratio") +
+    xlab("log(travelling ratio)") +
+    ylab("proportion")
+dev.off()
+```
+
+# same with TNFa list
+```{r}
+tnfa.300 <- tnfa.dt[which((tnfa.dt$V3 - tnfa.dt$V2) > 300), ]
+tnfa.tss <- data.frame(
+  "GeneID" = tnfa.300$V4,
+  "Chr" = tnfa.300$V1,
+  "Start" = tnfa.300$V2 - 30, 
+  "End" = tnfa.300$V2 + 300,
+  "Strand" = tnfa.300$V6
+)
+tnfa.body <- data.frame(
+  "GeneID" = tnfa.300$V4,
+  "Chr" = tnfa.300$V1,
+  "Start" = tnfa.300$V2 + 300, 
+  "End" = tnfa.300$V3,
+  "Strand" = tnfa.300$V6
+)
+
+# get counts over regions
+tss.counts <- featureCounts(
+  files = ints.bams,
+  annot.ext = tnfa.tss,
+  largestOverlap = TRUE
+)
+body.counts <- featureCounts(
+  files = ints.bams,
+  annot.ext = tnfa.body,
+  largestOverlap = TRUE
+)
+
+# get ratio of TSS/body for each sample, use log scale for readability
+tnfa.tr <- log10(tss.counts$counts/body.counts$counts)
+colnames(tnfa.tr) <- gsub(".sort.dedup.bam", "", colnames(tnfa.tr))
+
+# log format for ggplots
+cdf1 <- data.frame()
+for(k in c(1, 4)){
+  s.tr <- tnfa.tr[, k]
+  s.cdf <- cbind(rep(colnames(tnfa.tr)[k], length(s.tr)), s.tr)
+  cdf1 <- rbind(cdf1, s.cdf)
+}
+colnames(cdf1) <- c("sample", "logTR")
+cdf1$logTR <- as.numeric(cdf1$logTR)
+
+# make CDF plots
+pdf("plots/CDF_travelling_ratio_30_300_noTNFa.pdf")
+  ggplot(cdf1, aes(logTR, colour = sample)) +
+    stat_ecdf() +
+    theme_bw() +
+    theme(panel.grid = element_blank()) +
+    ggtitle("Cumulative distribution of travelling ratio") +
+    xlab("log(travelling ratio)") +
+    ylab("proportion")
+dev.off()
+
+cdf2 <- data.frame()
+for(k in 2:3){
+  s.tr <- tnfa.tr[, k]
+  s.cdf <- cbind(rep(colnames(tnfa.tr)[k], length(s.tr)), s.tr)
+  cdf2 <- rbind(cdf2, s.cdf)
+}
+colnames(cdf2) <- c("sample", "logTR")
+cdf2$logTR <- as.numeric(cdf2$logTR)
+
+# make CDF plots
+pdf("plots/CDF_travelling_ratio_30_300_TNFa.pdf")
+  ggplot(cdf2, aes(logTR, colour = sample)) +
+    stat_ecdf() +
+    theme_bw() +
+    theme(panel.grid = element_blank()) +
+    ggtitle("Cumulative distribution of travelling ratio") +
+    xlab("log(travelling ratio)") +
+    ylab("proportion")
+dev.off()
+```
+
+# same as above but for genes with no increase in Pol2 w/TNFa
+```{r}
+tmm.ints <- as.data.frame(ints.dge$counts %*% diag(ints.dge$samples$norm.factors))
+colnames(tmm.ints) <- colnames(ints.dge$counts)
+tmm.ints$ints.tnfa.fc <- tmm.ints$`INTS5-A2-TNFa_S8`/tmm.ints$`INTS5-A2-untreated_S7`
+tmm.ints <- subset(tmm.ints, ints.tnfa.fc <= 1)
+
+# limit DT bed to subset of genes and write out
+pol2.down <- dt.bed[which(dt.bed$V5 %in% rownames(tmm.ints)), ]
+
+p2d.300 <- pol2.down[which((pol2.down$V3 - pol2.down$V2) > 300), ]
+p2d.tss <- data.frame(
+  "GeneID" = p2d.300$V4,
+  "Chr" = p2d.300$V1,
+  "Start" = p2d.300$V2 - 30, 
+  "End" = p2d.300$V2 + 300,
+  "Strand" = p2d.300$V6
+)
+p2d.body <- data.frame(
+  "GeneID" = p2d.300$V4,
+  "Chr" = p2d.300$V1,
+  "Start" = p2d.300$V2 + 300, 
+  "End" = p2d.300$V3,
+  "Strand" = p2d.300$V6
+)
+
+# get counts over regions
+tss.counts <- featureCounts(
+  files = ints.bams,
+  annot.ext = p2d.tss,
+  largestOverlap = TRUE
+)
+body.counts <- featureCounts(
+  files = ints.bams,
+  annot.ext = p2d.body,
+  largestOverlap = TRUE
+)
+
+# get ratio of TSS/body for each sample, use log scale for readability
+p2d.tr <- log10(tss.counts$counts/body.counts$counts)
+colnames(p2d.tr) <- gsub(".sort.dedup.bam", "", colnames(p2d.tr))
+
+# log format for ggplots
+cdf1 <- data.frame()
+for(k in c(1, 4)){
+  s.tr <- p2d.tr[, k]
+  s.cdf <- cbind(rep(colnames(p2d.tr)[k], length(s.tr)), s.tr)
+  cdf1 <- rbind(cdf1, s.cdf)
+}
+colnames(cdf1) <- c("sample", "logTR")
+cdf1$logTR <- as.numeric(cdf1$logTR)
+
+# make CDF plots
+pdf("plots/CDF_travelling_ratio_30_300_noTNFa_Pol2down.pdf")
+  ggplot(cdf1, aes(logTR, colour = sample)) +
+    stat_ecdf() +
+    theme_bw() +
+    theme(panel.grid = element_blank()) +
+    ggtitle("Cumulative distribution of travelling ratio") +
+    xlab("log(travelling ratio)") +
+    ylab("proportion")
+dev.off()
+
+cdf2 <- data.frame()
+for(k in 2:3){
+  s.tr <- p2d.tr[, k]
+  s.cdf <- cbind(rep(colnames(p2d.tr)[k], length(s.tr)), s.tr)
+  cdf2 <- rbind(cdf2, s.cdf)
+}
+colnames(cdf2) <- c("sample", "logTR")
+cdf2$logTR <- as.numeric(cdf2$logTR)
+
+# make CDF plots
+pdf("plots/CDF_travelling_ratio_30_300_TNFa_Pol2down.pdf")
+  ggplot(cdf2, aes(logTR, colour = sample)) +
+    stat_ecdf() +
+    theme_bw() +
+    theme(panel.grid = element_blank()) +
+    ggtitle("Cumulative distribution of travelling ratio") +
+    xlab("log(travelling ratio)") +
+    ylab("proportion")
+dev.off()
+```
+
+
+# try profile plots with nfkb < 2500 bp list
+```{r}
+# write out nfkb.2500 bed
+write.table(
+  nfkb.2500,
+  "reference_files/NFKB_2500_DT.bed",
+  sep = "\t",
+  col.names = FALSE,
+  row.names = FALSE,
+  quote = FALSE
+)
+```
+
+```{bash}
+sbatch scripts/DTMat_INTS5_NFKB2500_profile.sbatch
+```
+
+# make lists of genes of interest for charlie
+```{r}
+m14d.m12d <- g1.fc[which(g1.fc$MED14.dTAG_v_MED14_FC < 0.5 & g1.fc$MED12.dTAG_v_MED12_FC > 1), ]
+# annotate with gene names
+ensg.ann <- fread("/data/reference/dawson_labs/biomart_annotations/Hsapiens/ensembl_hgnc_entrez.txt", select = 1:2)
+m14d.m12d$ensg <- rownames(m14d.m12d)
+m14d.m12d <- merge(m14d.m12d, ensg.ann, by.x = "ensg", by.y = "ensembl_gene_id")
+write.table(
+  m14d.m12d,
+  "reference_files/MED14low_MED12high_genes.txt",
+  sep = "\t",
+  col.names = TRUE,
+  row.names = FALSE,
+  quote = FALSE
+)
+
+m12d.m25d <- g1.fc[which(g1.fc$MED12.dTAG_v_MED12_FC < 0.6 & g1.fc$MED25.dTAG_v_MED25_FC < 0.6), ]
+m12d.m25d$ensg <- rownames(m12d.m25d)
+m12d.m25d <- merge(m12d.m25d, ensg.ann, by.x = "ensg", by.y = "ensembl_gene_id")
+write.table(
+  m12d.m25d,
+  "reference_files/MED12low_MED25low_genes.txt",
+  sep = "\t",
+  col.names = TRUE,
+  row.names = FALSE,
+  quote = FALSE
+)
+
+# also write out full table with all genes and gene names
+fc.ann <- g1.fc
+fc.ann$ensg <- rownames(fc.ann)
+fc.ann <- merge(fc.ann, ensg.ann, by.x = "ensg", by.y = "ensembl_gene_id")
+write.table(
+  fc.ann,
+  "results/all_genes_FC_table.txt",
+  sep = "\t",
+  col.names = TRUE,
+  row.names = FALSE,
+  quote = FALSE
+)
+```
+
+# make bed files from SLAMseq sig down genes and for histone genes for deeptools
+```{r}
+# slamseq sig down genes
+tc.down.bed <- dt.bed[which(dt.bed$V5 %in% tc.down), ]
+tot.down.bed <- dt.bed[which(dt.bed$V5 %in% tot.down), ]
+
+write.table(
+  tc.down.bed,
+  "reference_files/SLAMseq_TCcounts_MED14_dTAGvDMSO_sigDown.bed",
+  sep = "\t",
+  col.names = FALSE,
+  row.names = FALSE,
+  quote = FALSE
+)
+write.table(
+  tot.down.bed,
+  "reference_files/SLAMseq_counts_MED14_dTAGvDMSO_sigDown.bed",
+  sep = "\t",
+  col.names = FALSE,
+  row.names = FALSE,
+  quote = FALSE
+)
+
+# subset for histone genes only
+hist.bed <- dt.bed[grepl("^HIST|^H[2-4]", dt.bed$V4), ]
+write.table(
+  hist.bed,
+  "reference_files/histone_gene.bed",
+  sep = "\t",
+  col.names = FALSE,
+  row.names = FALSE,
+  quote = FALSE
+)
+```
+
+# submit matrix jobs
+```{bash}
+sbatch scripts/DTMat_MED_SLAM_TCdown_profile.sbatch
+sbatch scripts/DTMat_MED_SLAM_TOTdown_profile.sbatch
+sbatch scripts/DTMat_MED_allGenes_profile.sbatch
+sbatch scripts/DTMat_MED_histoneGenes_profile.sbatch
+```
+
+# get traveling index and CDF plots at all genes and MED14 DEGs for MED samples
+```{r}
+# first make saf of coordinates for all genes tss (+/- 2.5kb) and body (2.5k-TSS)
+# need to exclude any < 2.5k
+all.2500 <- dt.bed[which((dt.bed$V3 - dt.bed$V2) > 2500), ]
+all.tss <- data.frame(
+  "GeneID" = all.2500$V4,
+  "Chr" = all.2500$V1,
+  "Start" = all.2500$V2 - 2500, 
+  "End" = all.2500$V2 + 2500,
+  "Strand" = all.2500$V6
+)
+all.body <- data.frame(
+  "GeneID" = all.2500$V4,
+  "Chr" = all.2500$V1,
+  "Start" = all.2500$V2 + 2500, 
+  "End" = all.2500$V3,
+  "Strand" = all.2500$V6
+)
+
+# get counts over regions
+med.bams <- c("alignment/MED12-dTAG_S13.sort.dedup.bam", "alignment/MED12-CDK8i_S14.sort.dedup.bam", "alignment/MED12_S11.sort.dedup.bam", "alignment/MED14-dTAG_S16.sort.dedup.bam", "alignment/MED14-CDK8i_S17.sort.dedup.bam", "alignment/MED14_S15.sort.dedup.bam", "alignment/MED25-dTAG_S19.sort.dedup.bam", "alignment/MED25-CDK8i_S20.sort.dedup.bam", "alignment/MED25_S18.sort.dedup.bam")
+tss.counts <- featureCounts(
+  files = med.bams,
+  annot.ext = all.tss,
+  largestOverlap = TRUE
+)
+body.counts <- featureCounts(
+  files = med.bams,
+  annot.ext = all.body,
+  largestOverlap = TRUE
+)
+
+# get ratio of TSS/body for each sample, use log scale for readability
+all.tr <- log10(tss.counts$counts/body.counts$counts)
+colnames(all.tr) <- gsub(".sort.dedup.bam", "", colnames(all.tr))
+
+# log format for ggplots
+cdf.data <- data.frame()
+for(k in 1:9){
+  s.tr <- all.tr[, k]
+  s.cdf <- cbind(rep(colnames(all.tr)[k], length(s.tr)), s.tr)
+  cdf.data <- rbind(cdf.data, s.cdf)
+}
+colnames(cdf.data) <- c("sample", "logTR")
+cdf.data$logTR <- as.numeric(cdf.data$logTR)
+
+# make CDF plots
+pdf("plots/CDF_TR_2500_allGenes_MED.pdf")
+  ggplot(cdf.data, aes(logTR, colour = sample)) +
+    stat_ecdf() +
+    theme_bw() +
+    theme(panel.grid = element_blank()) +
+    ggtitle("Cumulative distribution of travelling ratio at all genes") +
+    xlab("log(travelling ratio)") +
+    ylab("proportion")
+dev.off()
+```
+
+# now for MED14 down DEGs from TC counts
+```{r}
+tc.2500 <- tc.down.bed[which((tc.down.bed$V3 - tc.down.bed$V2) > 2500), ]
+tc.tss <- data.frame(
+  "GeneID" = tc.2500$V4,
+  "Chr" = tc.2500$V1,
+  "Start" = tc.2500$V2 - 2500, 
+  "End" = tc.2500$V2 + 2500,
+  "Strand" = tc.2500$V6
+)
+tc.body <- data.frame(
+  "GeneID" = tc.2500$V4,
+  "Chr" = tc.2500$V1,
+  "Start" = tc.2500$V2 + 2500, 
+  "End" = tc.2500$V3,
+  "Strand" = tc.2500$V6
+)
+
+# get counts over regions
+tss.counts <- featureCounts(
+  files = med.bams,
+  annot.ext = tc.tss,
+  largestOverlap = TRUE
+)
+body.counts <- featureCounts(
+  files = med.bams,
+  annot.ext = tc.body,
+  largestOverlap = TRUE
+)
+
+# get ratio of TSS/body for each sample, use log scale for readability
+tc.tr <- log10(tss.counts$counts/body.counts$counts)
+colnames(tc.tr) <- gsub(".sort.dedup.bam", "", colnames(tc.tr))
+
+# log format for ggplots
+cdf.data <- data.frame()
+for(k in 1:9){
+  s.tr <- tc.tr[, k]
+  s.cdf <- cbind(rep(colnames(tc.tr)[k], length(s.tr)), s.tr)
+  cdf.data <- rbind(cdf.data, s.cdf)
+}
+colnames(cdf.data) <- c("sample", "logTR")
+cdf.data$logTR <- as.numeric(cdf.data$logTR)
+
+# make CDF plots
+pdf("plots/CDF_TR_2500_SLAMTC_MED14down_MED.pdf")
+  ggplot(cdf.data, aes(logTR, colour = sample)) +
+    stat_ecdf() +
+    theme_bw() +
+    theme(panel.grid = element_blank()) +
+    ggtitle("Cumulative distribution of TR at SLAM T>C counts MED14 down genes") +
+    xlab("log(travelling ratio)") +
+    ylab("proportion")
+dev.off()
+```
+
+# now for MED14 down DEGs from total counts
+```{r}
+tot.2500 <- tot.down.bed[which((tot.down.bed$V3 - tot.down.bed$V2) > 2500), ]
+tot.tss <- data.frame(
+  "GeneID" = tot.2500$V4,
+  "Chr" = tot.2500$V1,
+  "Start" = tot.2500$V2 - 2500, 
+  "End" = tot.2500$V2 + 2500,
+  "Strand" = tot.2500$V6
+)
+tot.body <- data.frame(
+  "GeneID" = tot.2500$V4,
+  "Chr" = tot.2500$V1,
+  "Start" = tot.2500$V2 + 2500, 
+  "End" = tot.2500$V3,
+  "Strand" = tot.2500$V6
+)
+
+# get counts over regions
+tss.counts <- featureCounts(
+  files = med.bams,
+  annot.ext = tot.tss,
+  largestOverlap = TRUE
+)
+body.counts <- featureCounts(
+  files = med.bams,
+  annot.ext = tot.body,
+  largestOverlap = TRUE
+)
+
+# get ratio of TSS/body for each sample, use log scale for readability
+tot.tr <- log10(tss.counts$counts/body.counts$counts)
+colnames(tot.tr) <- gsub(".sort.dedup.bam", "", colnames(tot.tr))
+
+# log format for ggplots
+cdf.data <- data.frame()
+for(k in 1:9){
+  s.tr <- tot.tr[, k]
+  s.cdf <- cbind(rep(colnames(tot.tr)[k], length(s.tr)), s.tr)
+  cdf.data <- rbind(cdf.data, s.cdf)
+}
+colnames(cdf.data) <- c("sample", "logTR")
+cdf.data$logTR <- as.numeric(cdf.data$logTR)
+
+# make CDF plots
+pdf("plots/CDF_TR_2500_SLAMTOT_MED14down_MED.pdf")
+  ggplot(cdf.data, aes(logTR, colour = sample)) +
+    stat_ecdf() +
+    theme_bw() +
+    theme(panel.grid = element_blank()) +
+    ggtitle("Cumulative distribution of TR at SLAM total counts") +
+    xlab("log(travelling ratio)") +
+    ylab("proportion")
+dev.off()
+```
+
+# now all 3 again with -30/+300
+```{r}
+# need to exclude any < 300
+all.300 <- dt.bed[which((dt.bed$V3 - dt.bed$V2) > 300), ]
+all.tss <- data.frame(
+  "GeneID" = all.300$V4,
+  "Chr" = all.300$V1,
+  "Start" = all.300$V2 - 30, 
+  "End" = all.300$V2 + 300,
+  "Strand" = all.300$V6
+)
+all.body <- data.frame(
+  "GeneID" = all.300$V4,
+  "Chr" = all.300$V1,
+  "Start" = all.300$V2 + 300, 
+  "End" = all.300$V3,
+  "Strand" = all.300$V6
+)
+
+# get counts over regions
+tss.counts <- featureCounts(
+  files = med.bams,
+  annot.ext = all.tss,
+  largestOverlap = TRUE
+)
+body.counts <- featureCounts(
+  files = med.bams,
+  annot.ext = all.body,
+  largestOverlap = TRUE
+)
+
+# get ratio of TSS/body for each sample, use log scale for readability
+all.tr <- log10(tss.counts$counts/body.counts$counts)
+colnames(all.tr) <- gsub(".sort.dedup.bam", "", colnames(all.tr))
+
+# log format for ggplots
+cdf.data <- data.frame()
+for(k in 1:9){
+  s.tr <- all.tr[, k]
+  s.cdf <- cbind(rep(colnames(all.tr)[k], length(s.tr)), s.tr)
+  cdf.data <- rbind(cdf.data, s.cdf)
+}
+colnames(cdf.data) <- c("sample", "logTR")
+cdf.data$logTR <- as.numeric(cdf.data$logTR)
+
+# make CDF plots
+pdf("plots/CDF_TR_30_300_allGenes_MED.pdf")
+  ggplot(cdf.data, aes(logTR, colour = sample)) +
+    stat_ecdf() +
+    theme_bw() +
+    theme(panel.grid = element_blank()) +
+    ggtitle("Cumulative distribution of travelling ratio at all genes") +
+    xlab("log(travelling ratio)") +
+    ylab("proportion")
+dev.off()
+```
+
+# now for MED14 down DEGs from TC counts
+```{r}
+tc.300 <- tc.down.bed[which((tc.down.bed$V3 - tc.down.bed$V2) > 300), ]
+tc.tss <- data.frame(
+  "GeneID" = tc.300$V4,
+  "Chr" = tc.300$V1,
+  "Start" = tc.300$V2 - 30, 
+  "End" = tc.300$V2 + 300,
+  "Strand" = tc.300$V6
+)
+tc.body <- data.frame(
+  "GeneID" = tc.300$V4,
+  "Chr" = tc.300$V1,
+  "Start" = tc.300$V2 + 300, 
+  "End" = tc.300$V3,
+  "Strand" = tc.300$V6
+)
+
+# get counts over regions
+tss.counts <- featureCounts(
+  files = med.bams,
+  annot.ext = tc.tss,
+  largestOverlap = TRUE
+)
+body.counts <- featureCounts(
+  files = med.bams,
+  annot.ext = tc.body,
+  largestOverlap = TRUE
+)
+
+# get ratio of TSS/body for each sample, use log scale for readability
+tc.tr <- log10(tss.counts$counts/body.counts$counts)
+colnames(tc.tr) <- gsub(".sort.dedup.bam", "", colnames(tc.tr))
+
+# log format for ggplots
+cdf.data <- data.frame()
+for(k in 1:9){
+  s.tr <- tc.tr[, k]
+  s.cdf <- cbind(rep(colnames(tc.tr)[k], length(s.tr)), s.tr)
+  cdf.data <- rbind(cdf.data, s.cdf)
+}
+colnames(cdf.data) <- c("sample", "logTR")
+cdf.data$logTR <- as.numeric(cdf.data$logTR)
+
+# make CDF plots
+pdf("plots/CDF_TR_30_300_SLAMTC_MED14down_MED.pdf")
+  ggplot(cdf.data, aes(logTR, colour = sample)) +
+    stat_ecdf() +
+    theme_bw() +
+    theme(panel.grid = element_blank()) +
+    ggtitle("Cumulative distribution of TR at SLAM T>C counts MED14 down genes") +
+    xlab("log(travelling ratio)") +
+    ylab("proportion")
+dev.off()
+```
+
+# now for MED14 down DEGs from total counts
+```{r}
+tot.300 <- tot.down.bed[which((tot.down.bed$V3 - tot.down.bed$V2) > 300), ]
+tot.tss <- data.frame(
+  "GeneID" = tot.300$V4,
+  "Chr" = tot.300$V1,
+  "Start" = tot.300$V2 - 30, 
+  "End" = tot.300$V2 + 300,
+  "Strand" = tot.300$V6
+)
+tot.body <- data.frame(
+  "GeneID" = tot.300$V4,
+  "Chr" = tot.300$V1,
+  "Start" = tot.300$V2 + 300, 
+  "End" = tot.300$V3,
+  "Strand" = tot.300$V6
+)
+
+# get counts over regions
+tss.counts <- featureCounts(
+  files = med.bams,
+  annot.ext = tot.tss,
+  largestOverlap = TRUE
+)
+body.counts <- featureCounts(
+  files = med.bams,
+  annot.ext = tot.body,
+  largestOverlap = TRUE
+)
+
+# get ratio of TSS/body for each sample, use log scale for readability
+tot.tr <- log10(tss.counts$counts/body.counts$counts)
+colnames(tot.tr) <- gsub(".sort.dedup.bam", "", colnames(tot.tr))
+
+# log format for ggplots
+cdf.data <- data.frame()
+for(k in 1:9){
+  s.tr <- tot.tr[, k]
+  s.cdf <- cbind(rep(colnames(tot.tr)[k], length(s.tr)), s.tr)
+  cdf.data <- rbind(cdf.data, s.cdf)
+}
+colnames(cdf.data) <- c("sample", "logTR")
+cdf.data$logTR <- as.numeric(cdf.data$logTR)
+
+# make CDF plots
+pdf("plots/CDF_TR_30_300_SLAMTOT_MED14down_MED.pdf")
+  ggplot(cdf.data, aes(logTR, colour = sample)) +
+    stat_ecdf() +
+    theme_bw() +
+    theme(panel.grid = element_blank()) +
+    ggtitle("Cumulative distribution of TR at SLAM total counts") +
+    xlab("log(travelling ratio)") +
+    ylab("proportion")
+dev.off()
+```
+
+# get bigwigs with LFC relative to controls and use these for heatmaps
+```{bash}
+# make LFC bigwigs with bamCompare
+sbatch scripts/DeeptoolsBamComp.sbatch alignment/MED12-dTAG_S13.sort.dedup.bam alignment/MED12_S11.sort.dedup.bam
+sbatch scripts/DeeptoolsBamComp.sbatch alignment/MED12-CDK8i_S14.sort.dedup.bam alignment/MED12_S11.sort.dedup.bam
+
+sbatch scripts/DeeptoolsBamComp.sbatch alignment/MED14-dTAG_S16.sort.dedup.bam alignment/MED14_S15.sort.dedup.bam
+sbatch scripts/DeeptoolsBamComp.sbatch alignment/MED14-CDK8i_S17.sort.dedup.bam alignment/MED14_S15.sort.dedup.bam
+
+sbatch scripts/DeeptoolsBamComp.sbatch alignment/MED25-dTAG_S19.sort.dedup.bam alignment/MED25_S18.sort.dedup.bam
+sbatch scripts/DeeptoolsBamComp.sbatch alignment/MED25-CDK8i_S20.sort.dedup.bam alignment/MED25_S18.sort.dedup.bam
+
+# make heatmaps from these bigwigs
+sbatch scripts/DTMat_MED_histoneGenes_LFC.sbatch
+sbatch scripts/DTMat_MED_allGenes_LFC.sbatch
+sbatch scripts/DTMat_MED_SLAM_TCdown_LFC.sbatch
+sbatch scripts/DTMat_MED_SLAM_TOTdown_LFC.sbatch
+```
+
+
+# save session info
+```{r}
+sesh.info <- capture.output(sessionInfo())
+writeLines(
+  sesh.info,
+  file.path(project.dir, "session-info", paste0(Sys.Date(), "_ChIPseq_230914.txt"))
+)
+```
