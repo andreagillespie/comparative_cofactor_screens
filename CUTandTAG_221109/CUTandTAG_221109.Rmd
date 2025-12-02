@@ -1,0 +1,86 @@
+---
+title: "CUTandTAG_221109"
+author: "Andrea"
+date: '2022-11-16'
+output: html_document
+---
+
+scratch project directory:
+/scratch/teams/dawson_genomics/Projects/CB_ChIP/CUTandTAG_221109
+
+FASTQ location:
+/pipeline/Archives/NextSeq/221109_NB501056_0879_AH7NCGBGXN/ProjectFolders/Project_Charles-Bell/
+
+# run fastqc first and check report
+```{bash}
+# from project scratch dir
+mkdir fastqc
+
+for fq in /pipeline/Runs/NextSeq/221109_NB501056_0879_AH7NCGBGXN/ProjectFolders/Project_Charles-Bell/*/*_R1_001.fastq.gz
+do
+bname=`basename $fq _R1_001.fastq.gz`
+sbatch scripts/fastqc.sbatch $fq /pipeline/Runs/NextSeq/221109_NB501056_0879_AH7NCGBGXN/ProjectFolders/Project_Charles-Bell/*/${bname}_R2_001.fastq.gz
+done
+
+# when fastqc is finished run multiqc 
+module load multiqc/1.8
+cd fastqc
+multiqc .
+cd ..
+```
+
+# use cut&run tools as in prev analysis, run step-wise only alignment & peak calling to get macs peaks
+```{bash}
+# build bowtie2 index from Charlie's reference
+module load bowtie2/2.3.4.1
+module load samtools/1.9
+
+cd reference
+bowtie2-build -f CB_reference.fa CB_reference.fa
+samtools faidx CB_reference.fa
+cut -f1,2 CB_reference.fa.fai > CB.chrom.sizes
+
+# run step-wise for more control, needs to be run from tools wd & use sym links in wd for fastqs
+cd cnrt_wd
+for fq in /pipeline/Runs/NextSeq/221109_NB501056_0879_AH7NCGBGXN/ProjectFolders/Project_Charles-Bell/*/*.fastq.gz
+do
+bname=`basename $fq`
+ln -s $fq ./$bname
+done
+
+# run validation and create scripts first, use software installed in prev project dir
+/dawson_genomics/Projects/JQ1VHL/CutandRun_211014_NB501056_0704_AHNYJVBGXK/cutandruntools/validate.py ../scripts/config.json
+/dawson_genomics/Projects/JQ1VHL/CutandRun_211014_NB501056_0704_AHNYJVBGXK/cutandruntools/create_scripts.py ../scripts/config.json
+
+for fq in ./*_R1_001.fastq.gz
+do
+sbatch integrated.sh $fq
+done
+
+for bam in aligned.aug10/*aligned_reads.bam
+do
+sbatch aligned.aug10/integrated.step2.sh $bam
+done
+```
+
+# post-process CnR tools output so it will work properly with diffpeaks (separate organisms and sort)
+```{bash}
+# run from cnrt output alignment dir
+cd aligned.aug10
+
+for bam in *aligned_reads.bam
+do
+sbatch ../../scripts/cnrt_postprocess_bams.sbatch $bam
+done
+
+# this dataset has a lot of duplication so make tdfs for dedup as well (run interactively)
+cd dedup
+module load igvtools/2.3.95
+
+for bam in *aligned_reads.bam
+do
+bname=`basename $bam _aligned_reads.bam`
+igvtools count $bam ${bname}.dedup.tdf hg19
+done
+```
+
