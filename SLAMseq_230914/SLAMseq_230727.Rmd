@@ -1,0 +1,1593 @@
+---
+title: "SLAMseq_230914"
+author: "Andrea"
+date: "22/09/2023"
+output: html_document
+---
+
+
+fastq location: /pipeline/Runs/NextSeq/230914_VH01624_22_AAC5NYWHV/ProjectFolders/Project_Jesse-Balic/
+project directory: /dawson_genomics/Projects/CB_ChIP/SLAMseq_230914
+
+# make joint Hg38Dm3 3'utr bed file for SLAMDUNK
+```{bash}
+cat /data/reference/dawson_labs/bed_files/Hg38/transcript_regions/Homo_sapiens.GRCh38.102_3utr.bed /dawson_genomics/Projects/zebrafish/SLAMSeq/210922_NB501056_0694_AHJJHWBGXK/reference_files/Dm6allutrsort.bed > /data/reference/dawson_labs/joint_genomes/GRCh38BDGP6/GRCh38BDGP6_3utr.bed
+```
+
+
+# set up project dir and run SLAMDUNK pipeline. Unless otherwise noted, everything is run from the project directory
+```{bash}
+mkdir slamout
+mkdir fastqc
+mkdir trimmed_fastqs
+mkdir logs
+mkdir scripts
+mkdir session-info
+mkdir results
+mkdir plots
+
+for fq in /pipeline/Runs/NextSeq/230914_VH01624_22_AAC5NYWHV/ProjectFolders/Project_Jesse-Balic/*/*_R1_001.fastq.gz
+do
+sbatch scripts/slamHg38Dm6.sbatch $fq
+done
+
+module load multiqc/1.8
+multiqc .
+```
+
+# Change collapse .csv files to .tsv
+```{bash, eval = F}
+cd slamout/collapse
+mkdir tsv
+for file in *.csv; do cp "$file" tsv/"${file%.csv}.tsv"; done
+```
+
+# load libraries and set paths
+```{r}
+library(edgeR)
+library(data.table)
+library(dplyr)
+library(RColorBrewer)
+library(Rsubread)
+library(ggplot2)
+library(ComplexHeatmap)
+library(circlize)
+
+project.dir <- "/dawson_genomics/Projects/CB_ChIP/SLAMseq_230914"
+slam.dir <- file.path(project.dir, 'slamout')
+tsv.dir <- file.path(slam.dir, 'collapse/tsv')
+plots.dir <- file.path(project.dir, 'plots')
+results.dir <- file.path(project.dir, 'results')
+```
+
+# Read in slam-dunk collapse counts files
+# col8 is total count
+# col9 is TC count
+```{r}
+files <- list.files(tsv.dir)
+
+# make sample annotation, take careful note of order of files (alphabetical) and ensure consistency and correctness of annotation
+sample.ann <- data.frame(
+  "files" = files, 
+  "samples" = gsub("_R1_001_trimmed.fq_slamdunk_mapped_filtered_tcount_collapsed.tsv", "", files), 
+  "treatment" = c(rep("CDKi", 3), rep("none", 3), rep("dTAG", 3), rep("none", 3), rep("dTAG", 4), rep("none", 4), rep("dTAG", 3), rep("none", 3), rep("none", 3)),
+  "cells" = c(rep("K562", 6), rep("MED12", 6), rep("MED14", 8), rep("MED25", 6), rep("unlabelled", 3)),
+  "replicate" = c(rep(1:3, 4), rep(1:4, 2), rep(1:3, 3))
+  )
+sample.ann$group <- paste0(sample.ann$cells, "_", sample.ann$treatment)
+
+# load counts and sample information
+counts.dge = readDGE(
+  file = files, 
+  path = tsv.dir, 
+  columns = c(1,8), 
+  group = sample.ann$group
+  )
+
+TCcounts.dge = readDGE(
+  file = files,
+  path = tsv.dir,
+  columns = c(1,9), 
+  group = sample.ann$group
+  )
+
+# cleaning up names
+row.names(counts.dge$samples) <- sample.ann$samples
+row.names(TCcounts.dge$samples) <- sample.ann$samples
+colnames(counts.dge$counts) <- sample.ann$samples
+colnames(TCcounts.dge$counts) <- sample.ann$samples
+```
+
+# write out raw counts
+```{r}
+write.table(
+  counts.dge$counts, 
+  "results/counts_raw_all.txt",
+  sep = "\t",
+  quote = F
+  )
+
+write.table(
+  TCcounts.dge$counts, 
+  "results/TCcounts_raw_all.txt",
+  sep = "\t",
+  quote = F
+  )
+```
+
+# separate organisms counts objects and make list for looping
+```{r}
+dros <- which(substr(rownames(counts.dge), 1, 4) == "FBgn")
+
+dros.counts <- counts.dge[dros, ]
+hg.counts <- counts.dge[-dros, ]
+dros.TCcounts <- TCcounts.dge[dros, ]
+hg.TCcounts <- TCcounts.dge[-dros, ]
+
+counts.obs <- list(hg.counts, dros.counts, hg.TCcounts, dros.TCcounts)
+```
+
+# Filtering out counts of genes with low counts
+```{r}
+# init variable for cpms list
+counts.cpms.list <- list()
+
+# loop through counts objects to apply same filtering to all
+for(counts.i in 1:length(counts.obs)){
+  counts.cpms.list[[counts.i]] <- cpm(counts.obs[[counts.i]])
+  noint <- rownames(counts.obs[[counts.i]]) %in% c("__no_feature", "__ambiguous", "__too_low_aQual", "__not_aligned", "__alignment_not_unique")
+  keep <- rowSums(counts.cpms.list[[counts.i]] >= 1) >= 2 & !noint
+  counts.obs[[counts.i]] <- counts.obs[[counts.i]][keep,]
+  counts.cpms.list[[counts.i]] <- counts.cpms.list[[counts.i]][keep,]
+}
+
+# set names for lists
+names(counts.obs) <- c("hg_counts", "dros_counts", "hg_TCcounts", "dros_TCcounts")
+names(counts.cpms.list) <- names(counts.obs)
+```
+
+# annotate filtered count files and write out
+```{r}
+hg.ann <- fread("/data/reference/dawson_labs/biomart_annotations/Hsapiens/ensembl_hgnc_entrez.txt")
+
+counts.names <- c(rep("counts", 2), rep("TCcounts", 2))
+
+for(i in c(1, 3)){
+  # for CPMs
+  counts.cpms.list[[i]] <- as.data.frame(counts.cpms.list[[i]])
+  counts.cpms.list[[i]]$hg.ensg <- rownames(counts.cpms.list[[i]])
+  counts.cpms.list[[i]] <- left_join(counts.cpms.list[[i]], hg.ann, by = c("hg.ensg" = "ensembl_gene_id")) 
+  write.table(
+    counts.cpms.list[[i]],
+    file.path(results.dir, paste0(counts.names[[i]], "_cpms_filtered.txt")),
+    sep = '\t',
+    quote = F
+    )  
+  
+  # same for raw counts
+  filt.counts.ann <- as.data.frame(counts.obs[[i]]$counts)
+  filt.counts.ann$hg.ensg <- rownames(counts.obs[[i]])
+  filt.counts.ann <- left_join(filt.counts.ann, hg.ann, by = c("hg.ensg" = "ensembl_gene_id"))
+  write.table(
+    filt.counts.ann,
+    file.path(results.dir, paste0(counts.names[[i]], "_filtered.txt")),
+    sep = "\t",
+    quote = FALSE
+    )
+
+}
+```
+
+# check number of genes after filtering 
+```{r}
+nrow(counts.obs$hg_counts$counts)
+nrow(counts.obs$hg_TCcounts$counts)
+```
+
+# Plot count numbers
+```{r}
+# Setting colours
+col.group <- counts.obs$hg_counts$samples$group
+levels(col.group) <- brewer.pal(nlevels(col.group), "Paired") 
+col.group <- as.character(col.group)
+
+pdf(file = file.path(plots.dir, "barplots_summary.pdf"), width = 6, height = 4)
+barplot(
+  colSums(counts.obs$hg_counts$counts), 
+  las = 2, 
+  main = "total reads", 
+  names.arg = sample.ann$samples,
+  col = col.group,
+  cex.names = 0.5
+)
+barplot(
+  colSums(counts.obs$hg_TCcounts$counts), 
+  las = 2, 
+  main = "T>C reads", 
+  names.arg = sample.ann$samples,
+  col = col.group,
+  cex.names = 0.5
+  )
+barplot(
+  colSums(counts.obs$hg_TCcounts$counts)/colSums(counts.obs$hg_counts$counts)*100, 
+  las = 2, 
+  main = "percentage T>C", 
+  names.arg = sample.ann$samples,
+  col = col.group,
+  cex.names = 0.5
+  )
+dev.off()
+```
+
+# TC%
+```{r}
+colSums(counts.obs$hg_TCcounts$counts)/colSums(counts.obs$hg_counts$counts)*100
+```
+
+# make new dge objects with organisms separate (so that library size is organism specific)
+```{r}
+d.counts.obs <- list()
+
+for(i in 1:length(counts.obs)){
+  d.counts.obs[[i]] = DGEList(counts = counts.obs[[i]]$counts, group = counts.obs[[i]]$samples$group)
+}
+
+# use same names 
+names(d.counts.obs) <- names(counts.obs)
+```
+
+# Barplot of library sizes (un-normalised)
+```{r}
+pdf(file.path(plots.dir, "barplots_librarysize.pdf"), width = 6, height = 4)
+barplot(
+  d.counts.obs$hg_counts$samples$lib.size,
+  names.arg = sample.ann$samples,
+  las = 2, 
+  main = "Library sizes (counts)",
+  col = col.group,
+  cex.names = 0.5
+  )
+barplot(
+  d.counts.obs$hg_TCcounts$samples$lib.size,
+  names.arg = sample.ann$samples,
+  las = 2, 
+  main = "Library sizes (TC counts)",
+  col = col.group,
+  cex.names = 0.5
+  )
+barplot(
+  d.counts.obs$dros_counts$samples$lib.size,
+  names.arg = sample.ann$samples,
+  las = 2, 
+  main = "Library sizes (Dm counts)",
+  col = col.group,
+  cex.names = 0.5
+  )
+barplot(
+  d.counts.obs$dros_TCcounts$samples$lib.size,
+  names.arg = sample.ann$samples,
+  las = 2, 
+  main = "Library sizes (Dm TC counts)",
+  col = col.group,
+  cex.names = 0.5
+  )
+dev.off()
+```
+
+# MDS plots
+```{r}
+pdf(file.path(plots.dir, "MDS_unnorm_counts.pdf"))
+plotMDS(
+  d.counts.obs$hg_counts,
+  labels = rownames(d.counts.obs$hg_counts$sampleName),
+  main = "unnormalised counts",
+  col = col.group
+  )
+dev.off()
+```
+
+# MDS plot TC counts
+```{r}
+pdf(file.path(plots.dir, "MDS_unnorm_TCcounts.pdf"))
+plotMDS(
+  d.counts.obs$hg_TCcounts,
+  labels = rownames(d.counts.obs$hg_TCcounts$sampleName),
+  main = "unnormalised T>C counts",
+  col = col.group
+  )
+dev.off()
+```
+
+# T>C counts cluster only by labelled or not, so do MDS of these without unlabelled
+```{r}
+pdf(file.path(plots.dir, "MDS_unnorm_TCcounts_labelledonly.pdf"))
+plotMDS(
+  d.counts.obs$hg_TCcounts[, 1:26],
+  labels = rownames(d.counts.obs$hg_TCcounts$sampleName)[1:26],
+  main = "unnormalised T>C counts, labelled only",
+  col = col.group
+  )
+dev.off()
+```
+
+# check Dros normalisation 
+```{r}
+# calc TMM norm for dros counts first
+d.counts.obs$dros_counts <- calcNormFactors(d.counts.obs$dros_counts, method = "TMM")
+# now set same norm factors for hg counts and TCcounts
+d.counts.obs$hg_counts$samples$norm.factors <- d.counts.obs$dros_counts$samples$norm.factors
+d.counts.obs$hg_TCcounts$samples$norm.factors <- d.counts.obs$dros_counts$samples$norm.factors
+```
+
+# MDS for normalised data
+```{r}
+pdf(file.path(plots.dir, "MDS_spikeinnorm_counts.pdf"))
+plotMDS(
+  d.counts.obs$hg_counts,
+  labels = colnames(d.counts.obs$hg_counts), 
+  main = "Dm spike-in normalised counts",
+  col = col.group
+  )
+dev.off()
+```
+
+# MDS of normalised TCcounts
+```{r}
+pdf(file.path(plots.dir, "MDS_spikeinnorm_TCcounts.pdf"))
+plotMDS(
+  d.counts.obs$hg_TCcounts,
+  labels = colnames(d.counts.obs$hg_TCcounts), 
+  main = "Dm spike-in normalised T>C counts",
+  col = col.group
+  )
+dev.off()
+```
+
+# MDS without unlabelled
+```{r}
+pdf(file.path(plots.dir, "MDS_spikeinnorm_TCcounts_labelledonly.pdf"))
+plotMDS(
+  d.counts.obs$hg_TCcounts[, 1:26],
+  labels = colnames(d.counts.obs$hg_TCcounts)[1:26], 
+  main = "Dm spike-in normalised T>C counts, labelled only",
+  col = col.group
+  )
+dev.off()
+```
+
+# Now TMM as normalisation factor
+```{r}
+# calc TMM norm for all counts first
+d.counts.obs$hg_counts <- calcNormFactors(d.counts.obs$hg_counts, method = "TMM")
+# now set same norm factors for TCcounts
+d.counts.obs$hg_TCcounts$samples$norm.factors <- d.counts.obs$hg_counts$samples$norm.factors
+```
+
+# MDS for normalised data
+```{r}
+pdf(file.path(plots.dir, "MDS_TMMnorm_counts.pdf"))
+plotMDS(
+  d.counts.obs$hg_counts,
+  labels = colnames(d.counts.obs$hg_counts), 
+  main = "TMM normalised counts",
+  col = col.group
+  )
+dev.off()
+```
+
+# MDS of normalised TCcounts
+```{r}
+pdf(file.path(plots.dir, "MDS_TMMnorm_TCcounts.pdf"))
+plotMDS(
+  d.counts.obs$hg_TCcounts,
+  labels = colnames(d.counts.obs$hg_TCcounts), 
+  main = "TMM normalised TC counts",
+  col = col.group
+  )
+dev.off()
+```
+
+# MDS without unlabelled
+```{r}
+pdf(file.path(plots.dir, "MDS_TMMnorm_TCcounts_labelledonly.pdf"))
+plotMDS(
+  d.counts.obs$hg_TCcounts[, 1:26],
+  labels = colnames(d.counts.obs$hg_TCcounts)[1:26], 
+  main = "TMM normalised T>C counts, labelled only",
+  col = col.group
+  )
+dev.off()
+```
+
+# make a table of library sizes and normalisation factors for Charlie 
+```{r}
+lib.table <- data.frame(
+  "Hs_lib_size" = d.counts.obs$hg_counts$samples$lib.size, 
+  "Dm_lib_size" = d.counts.obs$dros_counts$samples$lib.size, 
+  "Hs_TMM_norm_factor" = d.counts.obs$hg_counts$samples$norm.factors, 
+  "Dm_TMM_norm_factor" = d.counts.obs$dros_counts$samples$norm.factors
+  )
+
+write.table(
+  lib.table,
+  file.path(results.dir, "libsize_normfactor_table.txt"),
+  sep = "\t",
+  col.names = TRUE,
+  row.names = FALSE,
+  quote = FALSE
+)
+
+# also one for Hs counts from each sample
+hg.counts.table <- rbind(colSums(counts.obs$hg_counts$counts), colSums(counts.obs$hg_TCcounts$counts))
+rownames(hg.counts.table) <- c("total.counts", "TC.counts")
+
+write.table(
+  hg.counts.table,
+  file.path(results.dir, "Hs_counts_table.txt"),
+  sep = "\t",
+  col.names = NA,
+  row.names = TRUE,
+  quote = FALSE
+)
+```
+
+# start with TC counts using hg TMM normalisation
+# first remove rep 4 for MED14 as others only have 3 reps and 4th seems to be an outlier anyway
+```{r}
+d.counts.obs$hg_counts <- d.counts.obs$hg_counts[, -c(16, 20)]
+d.counts.obs$hg_TCcounts <- d.counts.obs$hg_TCcounts[, -c(16, 20)]
+```
+
+
+# set design and contrasts
+```{r}
+# design table
+design = model.matrix(~0+group, data = d.counts.obs$hg_TCcounts$samples)
+colnames(design) <- gsub("group", colnames(design), replacement = "")
+design
+
+contr.matrix <- makeContrasts(
+  K562_CDKivsDMSO = K562_CDKi-K562_none,
+  MED12_dTAGvDMSO = MED12_dTAG-MED12_none,
+  MED14_dTAGvDMSO = MED14_dTAG-MED14_none,
+  MED25_dTAGvDMSO = MED25_dTAG-MED25_none,
+  levels = colnames(design)
+  )
+contr.matrix
+```
+
+# make annotation with transcript ID, gene name
+```{r}
+gff.name <- flattenGTF(
+    "/data/reference/dawson_labs/genomes/Hg38/Homo_sapiens.GRCh38.102.gtf",
+    GTF.featureType = "transcript",
+    GTF.attrType = "gene_name",
+    method = "merge"
+    )
+
+gff.enst <- flattenGTF(
+    "/data/reference/dawson_labs/genomes/Hg38/Homo_sapiens.GRCh38.102.gtf",
+    GTF.featureType = "transcript",
+    GTF.attrType = "transcript_id",
+    method = "merge"
+    )
+
+gene.ann <- merge(
+  gff.name, 
+  gff.enst, 
+  by.x = c("Chr", "Start", "End", "Strand"), 
+  by.y = c("Chr", "Start", "End", "Strand")
+  )
+colnames(gene.ann)[5:6] <- c("Symbol", "ENST")
+
+# write out to refs
+write.table(
+  gene.ann,
+  "/data/reference/dawson_labs/biomart_annotations/Hsapiens/Hg38_ENST_symbol_ann.txt",
+  sep = "\t",
+  col.names = TRUE,
+  row.names = FALSE,
+  quote = FALSE
+)
+```
+
+# EdgeR DE
+```{r}
+d_hg_TCcounts <- estimateDisp(d.counts.obs$hg_TCcounts, design)
+gfit_hg_TCcounts <- glmQLFit(d_hg_TCcounts, design)
+ftest.list <- list()
+
+for(contrast.i in 1:length(colnames(contr.matrix))){
+  ftest.list[[contrast.i]] <- glmQLFTest(gfit_hg_TCcounts, contrast = contr.matrix[ , contrast.i])
+}
+
+# add names for referencing
+names(ftest.list) <- colnames(contr.matrix)
+
+# make scatterplots w/spearman cor for each comparison
+pdf(file.path(plots.dir, "Corr_plots_TCcounts.pdf"))
+for(i in 1:4){
+  for(j in 1:4){
+    plotcor <- cor.test(2^ftest.list[[i]]$table$logFC, 2^ftest.list[[j]]$table$logFC, method = "spearman")
+    plot(
+      2^ftest.list[[i]]$table$logFC, 
+      2^ftest.list[[j]]$table$logFC, 
+      main = paste0("Spearman's rho: ", round(plotcor$estimate, 5)),
+      xlab = names(ftest.list)[[i]],
+      ylab = names(ftest.list)[[j]]
+      )
+    abline(2^ftest.list[[j]]$table$logFC ~ 2^ftest.list[[i]]$table$logFC, col = "red")
+  }
+}
+dev.off()
+```
+
+# Do same DE analysis for total counts
+```{r}
+d_hg_counts <- estimateDisp(d.counts.obs$hg_counts, design)
+gfit_hg_counts <- glmQLFit(d_hg_counts, design)
+tot.ftest.list <- list()
+
+for(contrast.i in 1:length(colnames(contr.matrix))){
+  tot.ftest.list[[contrast.i]] <- glmQLFTest(gfit_hg_counts, contrast = contr.matrix[ , contrast.i])
+}
+
+# add names for referencing
+names(tot.ftest.list) <- colnames(contr.matrix)
+
+# make scatterplots w/spearman cor for each comparison
+pdf(file.path(plots.dir, "Corr_plots_ALLcounts.pdf"))
+for(i in 1:4){
+  for(j in 1:4){
+    plotcor <- cor.test(2^tot.ftest.list[[i]]$table$logFC, 2^tot.ftest.list[[j]]$table$logFC, method = "spearman")
+    plot(
+      2^tot.ftest.list[[i]]$table$logFC, 
+      2^tot.ftest.list[[j]]$table$logFC, 
+      main = paste0("Spearman's rho: ", round(plotcor$estimate, 5)),
+      xlab = names(tot.ftest.list)[[i]],
+      ylab = names(tot.ftest.list)[[j]]
+      )
+    abline(2^tot.ftest.list[[j]]$table$logFC ~ 2^tot.ftest.list[[i]]$table$logFC, col = "red")
+  }
+}
+dev.off()
+```
+
+# DE with voom and MA plots for each contrast
+# For TCcounts first
+```{r}
+v.TCcounts = voom(d.counts.obs$hg_TCcounts, design, plot = TRUE)
+vfit.TCcounts <- lmFit(v.TCcounts, design)
+vfit.TCcounts <- contrasts.fit(vfit.TCcounts, contrasts = contr.matrix)
+efit.TCcounts <- eBayes(vfit.TCcounts)
+plotSA(efit.TCcounts)
+```
+
+# Summary of contrasts (number of DE genes)
+```{r}
+summary(decideTests(efit.TCcounts))
+```
+
+# Summary of contrasts with FC greater than 1.2
+```{r}
+tfit.TCcounts <- treat(vfit.TCcounts, lfc = 0.26)
+dt.TCcounts <- decideTests(tfit.TCcounts)
+summary(dt.TCcounts)
+```
+
+# DE 
+```{r}
+# initialise list
+TC.contrast.list <- list()
+
+for(contrast.i in 1:length(colnames(contr.matrix))){
+  TC.contrast.list[[contrast.i]] <- topTreat(tfit.TCcounts, coef = contrast.i, n = Inf)
+  TC.contrast.list[[contrast.i]]$enst <- gsub("_3utr", "", rownames(TC.contrast.list[[contrast.i]]))
+  TC.contrast.list[[contrast.i]] <- merge(TC.contrast.list[[contrast.i]], gene.ann, by.x = "enst", by.y = "ENST")
+  write.table(
+    TC.contrast.list[[contrast.i]],
+    file.path(results.dir, paste0(colnames(contr.matrix)[[contrast.i]], "_TCcounts_DEtable.txt")),
+    sep = "\t",
+    quote = FALSE,
+    row.names = FALSE,
+    col.names = TRUE
+    )
+  
+  # write out sig only
+  write.table(
+    TC.contrast.list[[contrast.i]][which(TC.contrast.list[[contrast.i]]$adj.P.Val < 0.1), ],
+    file.path(results.dir, paste0(colnames(contr.matrix)[[contrast.i]], "_TCcounts_DEtable_sigonly.txt")),
+    sep = "\t",
+    quote = FALSE,
+    row.names = FALSE,
+    col.names = TRUE
+    )
+}
+
+names(TC.contrast.list) <- colnames(contr.matrix)
+```
+
+MA plots
+```{r}
+for(contrast.i in 1:length(TC.contrast.list)){
+  pdf(file.path(plots.dir, paste0("MAplot_", colnames(tfit.TCcounts)[contrast.i], "_TCcounts.pdf")))
+  plotMD(
+    tfit.TCcounts, 
+    column = contrast.i, 
+    status = dt.TCcounts[,contrast.i],
+    main = colnames(tfit.TCcounts)[contrast.i]
+    )
+  dev.off()
+}
+```
+
+# make cor plots with these LFC values
+```{r}
+# make scatterplots w/spearman cor for each comparison
+pdf(file.path(plots.dir, "Corr_plots_TCcounts_LFC.pdf"))
+for(i in 1:4){
+  for(j in 1:4){
+    plotcor <- cor.test(TC.contrast.list[[i]]$logFC, TC.contrast.list[[j]]$logFC, method = "spearman")
+    plot(
+      TC.contrast.list[[i]]$logFC, 
+      TC.contrast.list[[j]]$logFC, 
+      main = paste0("Spearman's rho: ", round(plotcor$estimate, 5)),
+      xlab = names(TC.contrast.list)[[i]],
+      ylab = names(TC.contrast.list)[[j]]
+      )
+    abline(TC.contrast.list[[j]]$logFC ~ TC.contrast.list[[i]]$logFC, col = "red")
+  }
+}
+dev.off()
+```
+
+# get avg norm counts for K562 DMSO samples and subset by top 10k/5k/2.5k/1k expressed genes
+```{r}
+# get mean across norm exp values for K562 control samples
+k562.exp <- rowMeans(d.counts.obs$hg_TCcounts$counts[, 4:6] %*% diag(d.counts.obs$hg_TCcounts$samples$norm.factors[4:6]))
+
+# clean up names to match table
+names(k562.exp) <- gsub("_3utr", "", names(k562.exp))
+
+# make df of exp and enst to merge with table
+k562.exp <- data.frame(
+  "k562.exp" = k562.exp,
+  "enst" = names(k562.exp)
+)
+```
+
+# now do cor scatterplots as above for each threshold
+```{r}
+# add k562 exp to table, order by k562 exp and take top n for each
+for(contrast.i in 1:length(colnames(contr.matrix))){
+  TC.contrast.list[[contrast.i]] <- merge(TC.contrast.list[[contrast.i]], k562.exp, by.x = "enst", by.y = "enst")
+  TC.contrast.list[[contrast.i]] <- TC.contrast.list[[contrast.i]][order(TC.contrast.list[[contrast.i]]$k562.exp, decreasing = TRUE), ]
+}
+
+pdf(file.path(plots.dir, "Corr_plots_TCcounts_LFC_10k.pdf"))
+for(i in 1:4){
+  for(j in 1:4){
+    plotcor <- cor.test(TC.contrast.list[[i]]$logFC[1:10000], TC.contrast.list[[j]]$logFC[1:10000], method = "spearman")
+    plot(
+      TC.contrast.list[[i]]$logFC[1:10000], 
+      TC.contrast.list[[j]]$logFC[1:10000], 
+      main = paste0("Spearman's rho: ", round(plotcor$estimate, 5)),
+      xlab = names(TC.contrast.list)[[i]],
+      ylab = names(TC.contrast.list)[[j]]
+      )
+    abline(TC.contrast.list[[j]]$logFC[1:10000] ~ TC.contrast.list[[i]]$logFC[1:10000], col = "red")
+  }
+}
+dev.off()
+
+pdf(file.path(plots.dir, "Corr_plots_TCcounts_LFC_5k.pdf"))
+for(i in 1:4){
+  for(j in 1:4){
+    plotcor <- cor.test(TC.contrast.list[[i]]$logFC[1:5000], TC.contrast.list[[j]]$logFC[1:5000], method = "spearman")
+    plot(
+      TC.contrast.list[[i]]$logFC[1:5000], 
+      TC.contrast.list[[j]]$logFC[1:5000], 
+      main = paste0("Spearman's rho: ", round(plotcor$estimate, 5)),
+      xlab = names(TC.contrast.list)[[i]],
+      ylab = names(TC.contrast.list)[[j]]
+      )
+    abline(TC.contrast.list[[j]]$logFC[1:5000] ~ TC.contrast.list[[i]]$logFC[1:5000], col = "red")
+  }
+}
+dev.off()
+
+pdf(file.path(plots.dir, "Corr_plots_TCcounts_LFC_2500.pdf"))
+for(i in 1:4){
+  for(j in 1:4){
+    plotcor <- cor.test(TC.contrast.list[[i]]$logFC[1:2500], TC.contrast.list[[j]]$logFC[1:2500], method = "spearman")
+    plot(
+      TC.contrast.list[[i]]$logFC[1:2500], 
+      TC.contrast.list[[j]]$logFC[1:2500], 
+      main = paste0("Spearman's rho: ", round(plotcor$estimate, 5)),
+      xlab = names(TC.contrast.list)[[i]],
+      ylab = names(TC.contrast.list)[[j]]
+      )
+    abline(TC.contrast.list[[j]]$logFC[1:2500] ~ TC.contrast.list[[i]]$logFC[1:2500], col = "red")
+  }
+}
+dev.off()
+
+pdf(file.path(plots.dir, "Corr_plots_TCcounts_LFC_1k.pdf"))
+for(i in 1:4){
+  for(j in 1:4){
+    plotcor <- cor.test(TC.contrast.list[[i]]$logFC[1:1000], TC.contrast.list[[j]]$logFC[1:1000], method = "spearman")
+    plot(
+      TC.contrast.list[[i]]$logFC[1:1000], 
+      TC.contrast.list[[j]]$logFC[1:1000], 
+      main = paste0("Spearman's rho: ", round(plotcor$estimate, 5)),
+      xlab = names(TC.contrast.list)[[i]],
+      ylab = names(TC.contrast.list)[[j]]
+      )
+    abline(TC.contrast.list[[j]]$logFC[1:1000] ~ TC.contrast.list[[i]]$logFC[1:1000], col = "red")
+  }
+}
+dev.off()
+```
+
+# now subset by MED12 and MED14 DE genes
+```{r}
+m12.genes <- TC.contrast.list$MED12_dTAGvDMSO$enst[which(TC.contrast.list$MED12_dTAGvDMSO$adj.P.Val < 0.05)]
+
+pdf(file.path(plots.dir, "Corr_plots_TCcounts_LFC_MED12DE.pdf"))
+for(i in 1:4){
+  for(j in 1:4){
+    plotcor <- cor.test(TC.contrast.list[[i]]$logFC[which(TC.contrast.list[[i]]$enst %in% m12.genes)], TC.contrast.list[[j]]$logFC[which(TC.contrast.list[[i]]$enst %in% m12.genes)], method = "spearman")
+    plot(
+      TC.contrast.list[[i]]$logFC[which(TC.contrast.list[[i]]$enst %in% m12.genes)], 
+      TC.contrast.list[[j]]$logFC[which(TC.contrast.list[[i]]$enst %in% m12.genes)], 
+      main = paste0("Spearman's rho: ", round(plotcor$estimate, 5)),
+      xlab = names(TC.contrast.list)[[i]],
+      ylab = names(TC.contrast.list)[[j]]
+      )
+    abline(TC.contrast.list[[j]]$logFC[which(TC.contrast.list[[i]]$enst %in% m12.genes)] ~ TC.contrast.list[[i]]$logFC[which(TC.contrast.list[[i]]$enst %in% m12.genes)], col = "red")
+  }
+}
+dev.off()
+
+m14.genes <- TC.contrast.list$MED14_dTAGvDMSO$enst[which(TC.contrast.list$MED14_dTAGvDMSO$adj.P.Val < 0.05)]
+
+pdf(file.path(plots.dir, "Corr_plots_TCcounts_LFC_MED14DE.pdf"))
+for(i in 1:4){
+  for(j in 1:4){
+    plotcor <- cor.test(TC.contrast.list[[i]]$logFC[which(TC.contrast.list[[i]]$enst %in% m14.genes)], TC.contrast.list[[j]]$logFC[which(TC.contrast.list[[i]]$enst %in% m14.genes)], method = "spearman")
+    plot(
+      TC.contrast.list[[i]]$logFC[which(TC.contrast.list[[i]]$enst %in% m14.genes)], 
+      TC.contrast.list[[j]]$logFC[which(TC.contrast.list[[i]]$enst %in% m14.genes)], 
+      main = paste0("Spearman's rho: ", round(plotcor$estimate, 5)),
+      xlab = names(TC.contrast.list)[[i]],
+      ylab = names(TC.contrast.list)[[j]]
+      )
+    abline(TC.contrast.list[[j]]$logFC[which(TC.contrast.list[[i]]$enst %in% m14.genes)] ~ TC.contrast.list[[i]]$logFC[which(TC.contrast.list[[i]]$enst %in% m14.genes)], col = "red")
+  }
+}
+dev.off()
+```
+
+
+# now for all counts
+```{r}
+v.counts = voom(d.counts.obs$hg_counts, design, plot = TRUE)
+vfit.counts <- lmFit(v.counts, design)
+vfit.counts <- contrasts.fit(vfit.counts, contrasts = contr.matrix)
+efit.counts <- eBayes(vfit.counts)
+plotSA(efit.counts)
+```
+
+# Summary of contrasts (number of DE genes)
+```{r}
+summary(decideTests(efit.counts))
+```
+
+# Summary of contrasts with FC greater than 1.2
+```{r}
+tfit.counts <- treat(vfit.counts, lfc = 0.26)
+dt.counts <- decideTests(tfit.counts)
+summary(dt.counts)
+```
+
+# DE 
+```{r}
+# initialise list
+contrast.list <- list()
+
+for(contrast.i in 1:length(colnames(contr.matrix))){
+  contrast.list[[contrast.i]] <- topTreat(tfit.counts, coef = contrast.i, n = Inf)
+  contrast.list[[contrast.i]]$enst <- gsub("_3utr", "", rownames(contrast.list[[contrast.i]]))
+  contrast.list[[contrast.i]] <- merge(contrast.list[[contrast.i]], gene.ann, by.x = "enst", by.y = "ENST")
+  write.table(
+    contrast.list[[contrast.i]],
+    file.path(results.dir, paste0(colnames(contr.matrix)[[contrast.i]], "_counts_DEtable.txt")),
+    sep = "\t",
+    quote = FALSE,
+    row.names = FALSE,
+    col.names = TRUE
+    )
+  
+  # write out sig only
+  write.table(
+    contrast.list[[contrast.i]][which(contrast.list[[contrast.i]]$adj.P.Val < 0.1), ],
+    file.path(results.dir, paste0(colnames(contr.matrix)[[contrast.i]], "_counts_DEtable_sigonly.txt")),
+    sep = "\t",
+    quote = FALSE,
+    row.names = FALSE,
+    col.names = TRUE
+    )
+}
+
+names(contrast.list) <- colnames(contr.matrix)
+```
+
+MA plots
+```{r}
+for(contrast.i in 1:length(contrast.list)){
+  pdf(file.path(plots.dir, paste0("MAplot_", colnames(tfit.counts)[contrast.i], "_counts.pdf")))
+  plotMD(
+    tfit.counts, 
+    column = contrast.i, 
+    status = dt.counts[, contrast.i],
+    main = colnames(tfit.counts)[contrast.i]
+    )
+  dev.off()
+}
+```
+
+# cor scatterplots
+```{r}
+pdf(file.path(plots.dir, "Corr_plots_counts_LFC.pdf"))
+for(i in 1:4){
+  for(j in 1:4){
+    plotcor <- cor.test(contrast.list[[i]]$logFC, contrast.list[[j]]$logFC, method = "spearman")
+    plot(
+      contrast.list[[i]]$logFC, 
+      contrast.list[[j]]$logFC, 
+      main = paste0("Spearman's rho: ", round(plotcor$estimate, 5)),
+      xlab = names(contrast.list)[[i]],
+      ylab = names(contrast.list)[[j]]
+      )
+    abline(contrast.list[[j]]$logFC ~ contrast.list[[i]]$logFC, col = "red")
+  }
+}
+dev.off()
+```
+
+# get avg norm counts for K562 DMSO samples and subset by top 10k/5k/2.5k/1k expressed genes
+```{r}
+# get mean across norm exp values for K562 control samples
+k562.exp <- rowMeans(d.counts.obs$hg_counts$counts[, 4:6] %*% diag(d.counts.obs$hg_counts$samples$norm.factors[4:6]))
+
+# clean up names to match table
+names(k562.exp) <- gsub("_3utr", "", names(k562.exp))
+
+# make df of exp and enst to merge with table
+k562.exp <- data.frame(
+  "k562.exp" = k562.exp,
+  "enst" = names(k562.exp)
+)
+```
+
+# now do cor scatterplots as above for each threshold
+```{r}
+# add k562 exp to table, order by k562 exp and take top n for each
+for(contrast.i in 1:length(colnames(contr.matrix))){
+  contrast.list[[contrast.i]] <- merge(contrast.list[[contrast.i]], k562.exp, by.x = "enst", by.y = "enst")
+  contrast.list[[contrast.i]] <- contrast.list[[contrast.i]][order(contrast.list[[contrast.i]]$k562.exp, decreasing = TRUE), ]
+}
+
+pdf(file.path(plots.dir, "Corr_plots_counts_LFC_10k.pdf"))
+for(i in 1:4){
+  for(j in 1:4){
+    plotcor <- cor.test(contrast.list[[i]]$logFC[1:10000], contrast.list[[j]]$logFC[1:10000], method = "spearman")
+    plot(
+      contrast.list[[i]]$logFC[1:10000], 
+      contrast.list[[j]]$logFC[1:10000], 
+      main = paste0("Spearman's rho: ", round(plotcor$estimate, 5)),
+      xlab = names(contrast.list)[[i]],
+      ylab = names(contrast.list)[[j]]
+      )
+    abline(contrast.list[[j]]$logFC[1:10000] ~ contrast.list[[i]]$logFC[1:10000], col = "red")
+  }
+}
+dev.off()
+
+pdf(file.path(plots.dir, "Corr_plots_counts_LFC_5k.pdf"))
+for(i in 1:4){
+  for(j in 1:4){
+    plotcor <- cor.test(contrast.list[[i]]$logFC[1:5000], contrast.list[[j]]$logFC[1:5000], method = "spearman")
+    plot(
+      contrast.list[[i]]$logFC[1:5000], 
+      contrast.list[[j]]$logFC[1:5000], 
+      main = paste0("Spearman's rho: ", round(plotcor$estimate, 5)),
+      xlab = names(contrast.list)[[i]],
+      ylab = names(contrast.list)[[j]]
+      )
+    abline(contrast.list[[j]]$logFC[1:5000] ~ contrast.list[[i]]$logFC[1:5000], col = "red")
+  }
+}
+dev.off()
+
+pdf(file.path(plots.dir, "Corr_plots_counts_LFC_2500.pdf"))
+for(i in 1:4){
+  for(j in 1:4){
+    plotcor <- cor.test(contrast.list[[i]]$logFC[1:2500], contrast.list[[j]]$logFC[1:2500], method = "spearman")
+    plot(
+      contrast.list[[i]]$logFC[1:2500], 
+      contrast.list[[j]]$logFC[1:2500], 
+      main = paste0("Spearman's rho: ", round(plotcor$estimate, 5)),
+      xlab = names(contrast.list)[[i]],
+      ylab = names(contrast.list)[[j]]
+      )
+    abline(contrast.list[[j]]$logFC[1:2500] ~ contrast.list[[i]]$logFC[1:2500], col = "red")
+  }
+}
+dev.off()
+
+pdf(file.path(plots.dir, "Corr_plots_counts_LFC_1k.pdf"))
+for(i in 1:4){
+  for(j in 1:4){
+    plotcor <- cor.test(contrast.list[[i]]$logFC[1:1000], contrast.list[[j]]$logFC[1:1000], method = "spearman")
+    plot(
+      contrast.list[[i]]$logFC[1:1000], 
+      contrast.list[[j]]$logFC[1:1000], 
+      main = paste0("Spearman's rho: ", round(plotcor$estimate, 5)),
+      xlab = names(contrast.list)[[i]],
+      ylab = names(contrast.list)[[j]]
+      )
+    abline(contrast.list[[j]]$logFC[1:1000] ~ contrast.list[[i]]$logFC[1:1000], col = "red")
+  }
+}
+dev.off()
+```
+
+# now subset by MED12 and MED14 DE genes
+```{r}
+m12.genes <- contrast.list$MED12_dTAGvDMSO$enst[which(contrast.list$MED12_dTAGvDMSO$adj.P.Val < 0.05)]
+
+pdf(file.path(plots.dir, "Corr_plots_counts_LFC_MED12DE.pdf"))
+for(i in 1:4){
+  for(j in 1:4){
+    plotcor <- cor.test(contrast.list[[i]]$logFC[which(contrast.list[[i]]$enst %in% m12.genes)], contrast.list[[j]]$logFC[which(contrast.list[[i]]$enst %in% m12.genes)], method = "spearman")
+    plot(
+      contrast.list[[i]]$logFC[which(contrast.list[[i]]$enst %in% m12.genes)], 
+      contrast.list[[j]]$logFC[which(contrast.list[[i]]$enst %in% m12.genes)], 
+      main = paste0("Spearman's rho: ", round(plotcor$estimate, 5)),
+      xlab = names(contrast.list)[[i]],
+      ylab = names(contrast.list)[[j]]
+      )
+    abline(contrast.list[[j]]$logFC[which(contrast.list[[i]]$enst %in% m12.genes)] ~ contrast.list[[i]]$logFC[which(contrast.list[[i]]$enst %in% m12.genes)], col = "red")
+  }
+}
+dev.off()
+
+m14.genes <- contrast.list$MED14_dTAGvDMSO$enst[which(contrast.list$MED14_dTAGvDMSO$adj.P.Val < 0.05)]
+
+pdf(file.path(plots.dir, "Corr_plots_counts_LFC_MED14DE.pdf"))
+for(i in 1:4){
+  for(j in 1:4){
+    plotcor <- cor.test(contrast.list[[i]]$logFC[which(contrast.list[[i]]$enst %in% m14.genes)], contrast.list[[j]]$logFC[which(contrast.list[[i]]$enst %in% m14.genes)], method = "spearman")
+    plot(
+      contrast.list[[i]]$logFC[which(contrast.list[[i]]$enst %in% m14.genes)], 
+      contrast.list[[j]]$logFC[which(contrast.list[[i]]$enst %in% m14.genes)], 
+      main = paste0("Spearman's rho: ", round(plotcor$estimate, 5)),
+      xlab = names(contrast.list)[[i]],
+      ylab = names(contrast.list)[[j]]
+      )
+    abline(contrast.list[[j]]$logFC[which(contrast.list[[i]]$enst %in% m14.genes)] ~ contrast.list[[i]]$logFC[which(contrast.list[[i]]$enst %in% m14.genes)], col = "red")
+  }
+}
+dev.off()
+```
+
+# make violin plots of LFC at all comps in both counts sets for MED12 & MED14 downregulated genes
+# start with T>C counts
+```{r}
+m12.down <- TC.contrast.list$MED12_dTAGvDMSO$enst[which(TC.contrast.list$MED12_dTAGvDMSO$adj.P.Val < 0.05 & TC.contrast.list$MED12_dTAGvDMSO$logFC < 0)]
+
+# create long format data for violin plot
+vio.data <- data.frame()
+for(k in 1:4){
+  m12.lfc <- TC.contrast.list[[k]]$logFC[which(TC.contrast.list[[k]]$enst %in% m12.down)]
+  comp.vio <- cbind(rep(names(TC.contrast.list)[[k]], length(m12.lfc)), m12.lfc)
+  vio.data <- rbind(vio.data, comp.vio)
+}
+colnames(vio.data) <- c("comparison", "LFC")
+vio.data$LFC <- as.numeric(vio.data$LFC)
+
+pdf(file.path(plots.dir, "violin_TCcounts_LFC_MED12down.pdf"))
+  ggplot(vio.data, aes(x = comparison, y = LFC, fill = comparison)) + 
+    geom_violin() +
+    theme_bw() +
+    theme(
+      panel.grid = element_blank(),
+      axis.ticks.x = element_blank(),
+      axis.text.x = element_blank(),
+      axis.title.x = element_blank()
+    )
+dev.off()
+
+m14.down <- TC.contrast.list$MED14_dTAGvDMSO$enst[which(TC.contrast.list$MED14_dTAGvDMSO$adj.P.Val < 0.05 & TC.contrast.list$MED14_dTAGvDMSO$logFC < 0)]
+
+# create long format data for violin plot
+vio.data <- data.frame()
+for(k in 1:4){
+  m14.lfc <- TC.contrast.list[[k]]$logFC[which(TC.contrast.list[[k]]$enst %in% m14.down)]
+  comp.vio <- cbind(rep(names(TC.contrast.list)[[k]], length(m14.lfc)), m14.lfc)
+  vio.data <- rbind(vio.data, comp.vio)
+}
+colnames(vio.data) <- c("comparison", "LFC")
+vio.data$LFC <- as.numeric(vio.data$LFC)
+
+pdf(file.path(plots.dir, "violin_TCcounts_LFC_MED14down.pdf"))
+  ggplot(vio.data, aes(x = comparison, y = LFC, fill = comparison)) + 
+    geom_violin() +
+    theme_bw() +
+    theme(
+      panel.grid = element_blank(),
+      axis.ticks.x = element_blank(),
+      axis.text.x = element_blank(),
+      axis.title.x = element_blank()
+    )
+dev.off()
+```
+
+# same for counts
+```{r}
+m12.down <- contrast.list$MED12_dTAGvDMSO$enst[which(contrast.list$MED12_dTAGvDMSO$adj.P.Val < 0.05 & contrast.list$MED12_dTAGvDMSO$logFC < 0)]
+
+# create long format data for violin plot
+vio.data <- data.frame()
+for(k in 1:4){
+  m12.lfc <- contrast.list[[k]]$logFC[which(contrast.list[[k]]$enst %in% m12.down)]
+  comp.vio <- cbind(rep(names(contrast.list)[[k]], length(m12.lfc)), m12.lfc)
+  vio.data <- rbind(vio.data, comp.vio)
+}
+colnames(vio.data) <- c("comparison", "LFC")
+vio.data$LFC <- as.numeric(vio.data$LFC)
+
+pdf(file.path(plots.dir, "violin_counts_LFC_MED12down.pdf"))
+  ggplot(vio.data, aes(x = comparison, y = LFC, fill = comparison)) + 
+    geom_violin() +
+    theme_bw() +
+    theme(
+      panel.grid = element_blank(),
+      axis.ticks.x = element_blank(),
+      axis.text.x = element_blank(),
+      axis.title.x = element_blank()
+    )
+dev.off()
+
+m14.down <- contrast.list$MED14_dTAGvDMSO$enst[which(contrast.list$MED14_dTAGvDMSO$adj.P.Val < 0.05 & contrast.list$MED14_dTAGvDMSO$logFC < 0)]
+
+# create long format data for violin plot
+vio.data <- data.frame()
+for(k in 1:4){
+  m14.lfc <- contrast.list[[k]]$logFC[which(contrast.list[[k]]$enst %in% m14.down)]
+  comp.vio <- cbind(rep(names(contrast.list)[[k]], length(m14.lfc)), m14.lfc)
+  vio.data <- rbind(vio.data, comp.vio)
+}
+colnames(vio.data) <- c("comparison", "LFC")
+vio.data$LFC <- as.numeric(vio.data$LFC)
+
+pdf(file.path(plots.dir, "violin_counts_LFC_MED14down.pdf"))
+  ggplot(vio.data, aes(x = comparison, y = LFC, fill = comparison)) + 
+    geom_violin() +
+    theme_bw() +
+    theme(
+      panel.grid = element_blank(),
+      axis.ticks.x = element_blank(),
+      axis.text.x = element_blank(),
+      axis.title.x = element_blank()
+    )
+dev.off()
+```
+
+# look at ranked lollipop plots as in ChIP analysis
+# start with TCcounts
+```{r}
+# make a table of LFCs first
+tc.lfc <- TC.contrast.list[[1]][, 1:2]
+for(i in 2:4){
+  con.lfc <- TC.contrast.list[[i]][, 1:2]
+  tc.lfc <- inner_join(tc.lfc, con.lfc, by = "enst", suffix = c("", paste0(".", names(TC.contrast.list)[[i]])))
+}
+colnames(tc.lfc)[2] <- paste0("logFC.", names(TC.contrast.list)[[1]])
+tc.lfc <- tc.lfc[, c(2:5, 1)]
+tc.lfc <- tc.lfc[-(which(duplicated(tc.lfc$enst))), ]
+
+pdf("plots/lollipop_corr_grid_TCcounts_5k.pdf")
+par(mfrow = c(4, 4))
+for(i in 1:4){
+  tc.lfc <- tc.lfc[order(tc.lfc[, i]), ]
+  tc.lfc$enst <- factor(tc.lfc$enst, levels = tc.lfc$enst)
+  for(j in 1:4){
+    plotcor <- cor.test(tc.lfc[, i], tc.lfc[, j], method = "spearman")
+    print(ggplot(tc.lfc, aes(x = tc.lfc$enst, y = tc.lfc[, j])) +
+      geom_segment(aes(x = tc.lfc$enst, xend = tc.lfc$enst, y = 0, yend = tc.lfc[, j]), color = "royalblue") +
+      geom_hline(yintercept = 0, color = "red") +
+      geom_point(color="royalblue", size = 1) +
+      theme_bw() +
+      theme(
+        panel.grid = element_blank(),
+        axis.ticks.x = element_blank(),
+        axis.text.x = element_blank()
+      ) +
+      ggtitle(gsub("_", " ", colnames(tc.lfc)[j])) +
+      xlab(paste0("Spearman's rho = ", plotcor$estimate)) +
+      ylab(paste0("FC order ", colnames(tc.lfc)[i]))) 
+  }
+}
+dev.off()
+
+# now 2500
+tc.lfc <- tc.lfc[1:2500, ]
+pdf("plots/lollipop_corr_grid_TCcounts_2500.pdf")
+par(mfrow = c(4, 4))
+for(i in 1:4){
+  tc.lfc <- tc.lfc[order(tc.lfc[, i]), ]
+  tc.lfc$enst <- factor(tc.lfc$enst, levels = tc.lfc$enst)
+  for(j in 1:4){
+    plotcor <- cor.test(tc.lfc[, i], tc.lfc[, j], method = "spearman")
+    print(ggplot(tc.lfc, aes(x = tc.lfc$enst, y = tc.lfc[, j])) +
+      geom_segment(aes(x = tc.lfc$enst, xend = tc.lfc$enst, y = 0, yend = tc.lfc[, j]), color = "royalblue") +
+      geom_hline(yintercept = 0, color = "red") +
+      geom_point(color="royalblue", size = 1) +
+      theme_bw() +
+      theme(
+        panel.grid = element_blank(),
+        axis.ticks.x = element_blank(),
+        axis.text.x = element_blank()
+      ) +
+      ggtitle(gsub("_", " ", colnames(tc.lfc)[j])) +
+      xlab(paste0("Spearman's rho = ", plotcor$estimate)) +
+      ylab(paste0("FC order ", colnames(tc.lfc)[i]))) 
+  }
+}
+dev.off()
+
+# and for 1k
+tc.lfc <- tc.lfc[1:1000, ]
+pdf("plots/lollipop_corr_grid_TCcounts_1k.pdf")
+par(mfrow = c(4, 4))
+for(i in 1:4){
+  tc.lfc <- tc.lfc[order(tc.lfc[, i]), ]
+  tc.lfc$enst <- factor(tc.lfc$enst, levels = tc.lfc$enst)
+  for(j in 1:4){
+    plotcor <- cor.test(tc.lfc[, i], tc.lfc[, j], method = "spearman")
+    print(ggplot(tc.lfc, aes(x = tc.lfc$enst, y = tc.lfc[, j])) +
+      geom_segment(aes(x = tc.lfc$enst, xend = tc.lfc$enst, y = 0, yend = tc.lfc[, j]), color = "royalblue") +
+      geom_hline(yintercept = 0, color = "red") +
+      geom_point(color="royalblue", size = 1) +
+      theme_bw() +
+      theme(
+        panel.grid = element_blank(),
+        axis.ticks.x = element_blank(),
+        axis.text.x = element_blank()
+      ) +
+      ggtitle(gsub("_", " ", colnames(tc.lfc)[j])) +
+      xlab(paste0("Spearman's rho = ", plotcor$estimate)) +
+      ylab(paste0("FC order ", colnames(tc.lfc)[i]))) 
+  }
+}
+dev.off()
+
+# also do med 12 & 14 gene lists, need to remake lfc table first
+tc.lfc <- TC.contrast.list[[1]][, 1:2]
+for(i in 2:4){
+  con.lfc <- TC.contrast.list[[i]][, 1:2]
+  tc.lfc <- inner_join(tc.lfc, con.lfc, by = "enst", suffix = c("", paste0(".", names(TC.contrast.list)[[i]])))
+}
+colnames(tc.lfc)[2] <- paste0("logFC.", names(TC.contrast.list)[[1]])
+tc.lfc <- tc.lfc[, c(2:5, 1)]
+tc.lfc <- tc.lfc[-(which(duplicated(tc.lfc$enst))), ]
+
+m12.genes <- TC.contrast.list$MED12_dTAGvDMSO$enst[which(TC.contrast.list$MED12_dTAGvDMSO$adj.P.Val < 0.05)]
+tc.lfc <- tc.lfc[which(tc.lfc$enst %in% m12.genes), ]
+pdf("plots/lollipop_corr_grid_TCcounts_MED12sig.pdf")
+par(mfrow = c(4, 4))
+for(i in 1:4){
+  tc.lfc <- tc.lfc[order(tc.lfc[, i]), ]
+  tc.lfc$enst <- factor(tc.lfc$enst, levels = tc.lfc$enst)
+  for(j in 1:4){
+    plotcor <- cor.test(tc.lfc[, i], tc.lfc[, j], method = "spearman")
+    print(ggplot(tc.lfc, aes(x = tc.lfc$enst, y = tc.lfc[, j])) +
+      geom_segment(aes(x = tc.lfc$enst, xend = tc.lfc$enst, y = 0, yend = tc.lfc[, j]), color = "royalblue") +
+      geom_hline(yintercept = 0, color = "red") +
+      geom_point(color="royalblue", size = 1) +
+      theme_bw() +
+      theme(
+        panel.grid = element_blank(),
+        axis.ticks.x = element_blank(),
+        axis.text.x = element_blank()
+      ) +
+      ggtitle(gsub("_", " ", colnames(tc.lfc)[j])) +
+      xlab(paste0("Spearman's rho = ", plotcor$estimate)) +
+      ylab(paste0("FC order ", colnames(tc.lfc)[i]))) 
+  }
+}
+dev.off()
+
+# now med 14
+tc.lfc <- TC.contrast.list[[1]][, 1:2]
+for(i in 2:4){
+  con.lfc <- TC.contrast.list[[i]][, 1:2]
+  tc.lfc <- inner_join(tc.lfc, con.lfc, by = "enst", suffix = c("", paste0(".", names(TC.contrast.list)[[i]])))
+}
+colnames(tc.lfc)[2] <- paste0("logFC.", names(TC.contrast.list)[[1]])
+tc.lfc <- tc.lfc[, c(2:5, 1)]
+tc.lfc <- tc.lfc[-(which(duplicated(tc.lfc$enst))), ]
+
+m14.genes <- TC.contrast.list$MED14_dTAGvDMSO$enst[which(TC.contrast.list$MED14_dTAGvDMSO$adj.P.Val < 0.05)]
+tc.lfc <- tc.lfc[which(tc.lfc$enst %in% m14.genes), ]
+pdf("plots/lollipop_corr_grid_TCcounts_MED14sig.pdf")
+par(mfrow = c(4, 4))
+for(i in 1:4){
+  tc.lfc <- tc.lfc[order(tc.lfc[, i]), ]
+  tc.lfc$enst <- factor(tc.lfc$enst, levels = tc.lfc$enst)
+  for(j in 1:4){
+    plotcor <- cor.test(tc.lfc[, i], tc.lfc[, j], method = "spearman")
+    print(ggplot(tc.lfc, aes(x = tc.lfc$enst, y = tc.lfc[, j])) +
+      geom_segment(aes(x = tc.lfc$enst, xend = tc.lfc$enst, y = 0, yend = tc.lfc[, j]), color = "royalblue") +
+      geom_hline(yintercept = 0, color = "red") +
+      geom_point(color="royalblue", size = 1) +
+      theme_bw() +
+      theme(
+        panel.grid = element_blank(),
+        axis.ticks.x = element_blank(),
+        axis.text.x = element_blank()
+      ) +
+      ggtitle(gsub("_", " ", colnames(tc.lfc)[j])) +
+      xlab(paste0("Spearman's rho = ", plotcor$estimate)) +
+      ylab(paste0("FC order ", colnames(tc.lfc)[i]))) 
+  }
+}
+dev.off()
+```
+
+# now for total counts
+```{r}
+# make a table of LFCs first
+tot.lfc <- contrast.list[[1]][, 1:2]
+for(i in 2:4){
+  con.lfc <- contrast.list[[i]][, 1:2]
+  tot.lfc <- inner_join(tot.lfc, con.lfc, by = "enst", suffix = c("", paste0(".", names(contrast.list)[[i]])))
+}
+colnames(tot.lfc)[2] <- paste0("logFC.", names(contrast.list)[[1]])
+tot.lfc <- tot.lfc[, c(2:5, 1)]
+tot.lfc <- tot.lfc[-(which(duplicated(tot.lfc$enst))), ]
+
+pdf("plots/lollipop_corr_grid_counts_5k.pdf")
+par(mfrow = c(4, 4))
+for(i in 1:4){
+  tot.lfc <- tot.lfc[order(tot.lfc[, i]), ]
+  tot.lfc$enst <- factor(tot.lfc$enst, levels = tot.lfc$enst)
+  for(j in 1:4){
+    plotcor <- cor.test(tot.lfc[, i], tot.lfc[, j], method = "spearman")
+    print(ggplot(tot.lfc, aes(x = tot.lfc$enst, y = tot.lfc[, j])) +
+      geom_segment(aes(x = tot.lfc$enst, xend = tot.lfc$enst, y = 0, yend = tot.lfc[, j]), color = "royalblue") +
+      geom_hline(yintercept = 0, color = "red") +
+      geom_point(color = "royalblue", size = 1) +
+      theme_bw() +
+      theme(
+        panel.grid = element_blank(),
+        axis.ticks.x = element_blank(),
+        axis.text.x = element_blank()
+      ) +
+      ggtitle(gsub("_", " ", colnames(tot.lfc)[j])) +
+      xlab(paste0("Spearman's rho = ", plotcor$estimate)) +
+      ylab(paste0("FC order ", colnames(tot.lfc)[i]))) 
+  }
+}
+dev.off()
+
+# now 2500
+tot.lfc <- tot.lfc[1:2500, ]
+pdf("plots/lollipop_corr_grid_counts_2500.pdf")
+par(mfrow = c(4, 4))
+for(i in 1:4){
+  tot.lfc <- tot.lfc[order(tot.lfc[, i]), ]
+  tot.lfc$enst <- factor(tot.lfc$enst, levels = tot.lfc$enst)
+  for(j in 1:4){
+    plotcor <- cor.test(tot.lfc[, i], tot.lfc[, j], method = "spearman")
+    print(ggplot(tot.lfc, aes(x = tot.lfc$enst, y = tot.lfc[, j])) +
+      geom_segment(aes(x = tot.lfc$enst, xend = tot.lfc$enst, y = 0, yend = tot.lfc[, j]), color = "royalblue") +
+      geom_hline(yintercept = 0, color = "red") +
+      geom_point(color="royalblue", size = 1) +
+      theme_bw() +
+      theme(
+        panel.grid = element_blank(),
+        axis.ticks.x = element_blank(),
+        axis.text.x = element_blank()
+      ) +
+      ggtitle(gsub("_", " ", colnames(tot.lfc)[j])) +
+      xlab(paste0("Spearman's rho = ", plotcor$estimate)) +
+      ylab(paste0("FC order ", colnames(tot.lfc)[i]))) 
+  }
+}
+dev.off()
+
+# and for 1k
+tot.lfc <- tot.lfc[1:1000, ]
+pdf("plots/lollipop_corr_grid_counts_1k.pdf")
+par(mfrow = c(4, 4))
+for(i in 1:4){
+  tot.lfc <- tot.lfc[order(tot.lfc[, i]), ]
+  tot.lfc$enst <- factor(tot.lfc$enst, levels = tot.lfc$enst)
+  for(j in 1:4){
+    plotcor <- cor.test(tot.lfc[, i], tot.lfc[, j], method = "spearman")
+    print(ggplot(tot.lfc, aes(x = tot.lfc$enst, y = tot.lfc[, j])) +
+      geom_segment(aes(x = tot.lfc$enst, xend = tot.lfc$enst, y = 0, yend = tot.lfc[, j]), color = "royalblue") +
+      geom_hline(yintercept = 0, color = "red") +
+      geom_point(color="royalblue", size = 1) +
+      theme_bw() +
+      theme(
+        panel.grid = element_blank(),
+        axis.ticks.x = element_blank(),
+        axis.text.x = element_blank()
+      ) +
+      ggtitle(gsub("_", " ", colnames(tot.lfc)[j])) +
+      xlab(paste0("Spearman's rho = ", plotcor$estimate)) +
+      ylab(paste0("FC order ", colnames(tot.lfc)[i]))) 
+  }
+}
+dev.off()
+
+# also do med 12 & 14 gene lists, need to remake lfc table first
+tot.lfc <- contrast.list[[1]][, 1:2]
+for(i in 2:4){
+  con.lfc <- contrast.list[[i]][, 1:2]
+  tot.lfc <- inner_join(tot.lfc, con.lfc, by = "enst", suffix = c("", paste0(".", names(contrast.list)[[i]])))
+}
+colnames(tot.lfc)[2] <- paste0("logFC.", names(contrast.list)[[1]])
+tot.lfc <- tot.lfc[, c(2:5, 1)]
+tot.lfc <- tot.lfc[-(which(duplicated(tot.lfc$enst))), ]
+
+m12.genes <- contrast.list$MED12_dTAGvDMSO$enst[which(contrast.list$MED12_dTAGvDMSO$adj.P.Val < 0.05)]
+tot.lfc <- tot.lfc[which(tot.lfc$enst %in% m12.genes), ]
+pdf("plots/lollipop_corr_grid_counts_MED12sig.pdf")
+par(mfrow = c(4, 4))
+for(i in 1:4){
+  tot.lfc <- tot.lfc[order(tot.lfc[, i]), ]
+  tot.lfc$enst <- factor(tot.lfc$enst, levels = tot.lfc$enst)
+  for(j in 1:4){
+    plotcor <- cor.test(tot.lfc[, i], tot.lfc[, j], method = "spearman")
+    print(ggplot(tot.lfc, aes(x = tot.lfc$enst, y = tot.lfc[, j])) +
+      geom_segment(aes(x = tot.lfc$enst, xend = tot.lfc$enst, y = 0, yend = tot.lfc[, j]), color = "royalblue") +
+      geom_hline(yintercept = 0, color = "red") +
+      geom_point(color="royalblue", size = 1) +
+      theme_bw() +
+      theme(
+        panel.grid = element_blank(),
+        axis.ticks.x = element_blank(),
+        axis.text.x = element_blank()
+      ) +
+      ggtitle(gsub("_", " ", colnames(tot.lfc)[j])) +
+      xlab(paste0("Spearman's rho = ", plotcor$estimate)) +
+      ylab(paste0("FC order ", colnames(tot.lfc)[i]))) 
+  }
+}
+dev.off()
+
+# now med 14
+tot.lfc <- contrast.list[[1]][, 1:2]
+for(i in 2:4){
+  con.lfc <- contrast.list[[i]][, 1:2]
+  tot.lfc <- inner_join(tot.lfc, con.lfc, by = "enst", suffix = c("", paste0(".", names(contrast.list)[[i]])))
+}
+colnames(tot.lfc)[2] <- paste0("logFC.", names(contrast.list)[[1]])
+tot.lfc <- tot.lfc[, c(2:5, 1)]
+tot.lfc <- tot.lfc[-(which(duplicated(tot.lfc$enst))), ]
+
+m14.genes <- contrast.list$MED14_dTAGvDMSO$enst[which(contrast.list$MED14_dTAGvDMSO$adj.P.Val < 0.05)]
+tot.lfc <- tot.lfc[which(tot.lfc$enst %in% m14.genes), ]
+pdf("plots/lollipop_corr_grid_counts_MED14sig.pdf")
+par(mfrow = c(4, 4))
+for(i in 1:4){
+  tot.lfc <- tot.lfc[order(tot.lfc[, i]), ]
+  tot.lfc$enst <- factor(tot.lfc$enst, levels = tot.lfc$enst)
+  for(j in 1:4){
+    plotcor <- cor.test(tot.lfc[, i], tot.lfc[, j], method = "spearman")
+    print(ggplot(tot.lfc, aes(x = tot.lfc$enst, y = tot.lfc[, j])) +
+      geom_segment(aes(x = tot.lfc$enst, xend = tot.lfc$enst, y = 0, yend = tot.lfc[, j]), color = "royalblue") +
+      geom_hline(yintercept = 0, color = "red") +
+      geom_point(color="royalblue", size = 1) +
+      theme_bw() +
+      theme(
+        panel.grid = element_blank(),
+        axis.ticks.x = element_blank(),
+        axis.text.x = element_blank()
+      ) +
+      ggtitle(gsub("_", " ", colnames(tot.lfc)[j])) +
+      xlab(paste0("Spearman's rho = ", plotcor$estimate)) +
+      ylab(paste0("FC order ", colnames(tot.lfc)[i]))) 
+  }
+}
+dev.off()
+```
+
+# heatmap of z-scored expression on med14 genes, TC counts first
+```{r}
+# get MED14 down reg genes
+m14.down <- TC.contrast.list$MED14_dTAGvDMSO$enst[which(TC.contrast.list$MED14_dTAGvDMSO$adj.P.Val < 0.05 & TC.contrast.list$MED14_dTAGvDMSO$logFC < 0)]
+
+# get norm counts
+tmm.counts <- d.counts.obs$hg_TCcounts$counts %*% diag(d.counts.obs$hg_TCcounts$samples$norm.factors)
+colnames(tmm.counts) <- colnames(d.counts.obs$hg_TCcounts$counts)
+
+# z-score
+tmm.heat <- as.data.frame(t(scale(t(tmm.counts[, c(7:9, 13:15, 19:21, 1:3, 10:12, 16:18, 22:24, 4:6)]))))
+
+# add enst as column, cleaned up names, then limit to med14 down genes
+tmm.heat$enst <- gsub("_3utr", "", rownames(tmm.heat))
+tmm.heat <- tmm.heat[which(tmm.heat$enst %in% m14.down), ]
+tmm.heat <- as.matrix(tmm.heat[, 1:24])
+
+col_fun = colorRamp2(c(-3, 0, 3), c("blue", "white", "red"))
+pdf(file.path(plots.dir, "Heatmap_TCcounts_MED14down.pdf"))
+Heatmap(tmm.heat, name = "z-score(TMM)", cluster_columns = FALSE, cluster_rows = TRUE, show_row_names = FALSE, column_names_gp = gpar(fontsize = 6), col = col_fun)
+dev.off()
+```
+
+# now for all counts
+```{r}
+# get MED14 down reg genes
+m14.down <- contrast.list$MED14_dTAGvDMSO$enst[which(contrast.list$MED14_dTAGvDMSO$adj.P.Val < 0.05 & contrast.list$MED14_dTAGvDMSO$logFC < 0)]
+
+# get norm counts
+all.tmm.counts <- d.counts.obs$hg_counts$counts %*% diag(d.counts.obs$hg_counts$samples$norm.factors)
+colnames(all.tmm.counts) <- colnames(d.counts.obs$hg_counts$counts)
+
+# z-score
+all.tmm.heat <- as.data.frame(t(scale(t(tmm.counts[, c(7:9, 13:15, 19:21, 1:3, 10:12, 16:18, 22:24, 4:6)]))))
+
+# add enst as column, cleaned up names, then limit to med14 down genes
+all.tmm.heat$enst <- gsub("_3utr", "", rownames(all.tmm.heat))
+all.tmm.heat <- all.tmm.heat[which(all.tmm.heat$enst %in% m14.down), ]
+all.tmm.heat <- as.matrix(all.tmm.heat[, 1:24])
+
+col_fun = colorRamp2(c(-3, 0, 3), c("blue", "white", "red"))
+pdf(file.path(plots.dir, "Heatmap_counts_MED14down.pdf"))
+Heatmap(all.tmm.heat, name = "z-score(TMM)", cluster_columns = FALSE, cluster_rows = TRUE, show_row_names = FALSE, column_names_gp = gpar(fontsize = 6), col = col_fun)
+dev.off()
+```
+
+# get list of genes DE in MED14 dTAG for both total and T>C to use in ChIPseq plots
+```{r}
+# get up and down separately to add as different colours
+# add ensg id to match chip
+ensg.ann <- fread("/data/reference/dawson_labs/biomart_annotations/Hsapiens/ensembl_hgnc_entrez.txt", select = 1:2)
+TC.cont.ensg <- merge(TC.contrast.list$MED14_dTAGvDMSO, ensg.ann, by.x = "Symbol", by.y = "hgnc_symbol")
+m14.tc.up.genes <- TC.cont.ensg$ensembl_gene_id[which(TC.cont.ensg$adj.P.Val < 0.05 & TC.cont.ensg$logFC > 0)]
+m14.tc.down.genes <- TC.cont.ensg$ensembl_gene_id[which(TC.cont.ensg$adj.P.Val < 0.05 & TC.cont.ensg$logFC < 0)]
+write.table(
+  m14.tc.up.genes,
+  "../ChIP_230912/reference_files/SLAMseq_TCcounts_MED14_dTAGvDMSO_sigUp_genelist.txt",
+  sep = "\t", 
+  col.names = FALSE,
+  row.names = FALSE,
+  quote = FALSE
+)
+write.table(
+  m14.tc.down.genes,
+  "../ChIP_230912/reference_files/SLAMseq_TCcounts_MED14_dTAGvDMSO_sigDown_genelist.txt",
+  sep = "\t", 
+  col.names = FALSE,
+  row.names = FALSE,
+  quote = FALSE
+)
+
+tot.cont.ensg <- merge(contrast.list$MED14_dTAGvDMSO, ensg.ann, by.x = "Symbol", by.y = "hgnc_symbol")
+m14.tot.up.genes <-tot.cont.ensg$ensembl_gene_id[which(tot.cont.ensg$adj.P.Val < 0.05 & tot.cont.ensg$logFC > 0)]
+m14.tot.down.genes <- tot.cont.ensg$ensembl_gene_id[which(tot.cont.ensg$adj.P.Val < 0.05 & tot.cont.ensg$logFC < 0)]
+m14.tot.up.genes <- tot.cont.ensg$ensembl_gene_id[which(tot.cont.ensg$adj.P.Val < 0.05 & tot.cont.ensg$logFC > 0)]
+m14.tot.down.genes <- tot.cont.ensg$ensembl_gene_id[which(tot.cont.ensg$adj.P.Val < 0.05 & tot.cont.ensg$logFC < 0)]
+write.table(
+  m14.tot.up.genes,
+  "../ChIP_230912/reference_files/SLAMseq_counts_MED14_dTAGvDMSO_sigUp_genelist.txt",
+  sep = "\t", 
+  col.names = FALSE,
+  row.names = FALSE,
+  quote = FALSE
+)
+write.table(
+  m14.tot.down.genes,
+  "../ChIP_230912/reference_files/SLAMseq_counts_MED14_dTAGvDMSO_sigDown_genelist.txt",
+  sep = "\t", 
+  col.names = FALSE,
+  row.names = FALSE,
+  quote = FALSE
+)
+```
+
+# get Pol2 chip MED14 dTAG v DMSO changes and correlate with SLAMseq
+```{r}
+m14.pol2 <- fread("../ChIP_230912/reference_files/Pol2ChIP_MED14dTAGvDMSO_FC.txt")
+
+# add pol2 data to table above
+TC.m14.pol2 <- merge(TC.cont.ensg, m14.pol2, by.x = "ensembl_gene_id", by.y = "V1")
+TC.m14.pol2$V2 <- log2(TC.m14.pol2$V2)
+colnames(TC.m14.pol2)[14] <- "Pol2_LFC_MED14dTAG"
+
+pdf(file.path(plots.dir, "Corr_plot_TCcounts_MED14dTAG_LFC_PolII_LFC.pdf"))
+plotcor <- cor.test(TC.m14.pol2$logFC, TC.m14.pol2$Pol2_LFC_MED14dTAG, method = "spearman")
+plot(
+  TC.m14.pol2$logFC, 
+  TC.m14.pol2$Pol2_LFC_MED14dTAG, 
+  main = paste0("Spearman's rho: ", round(plotcor$estimate, 2)),
+  xlab = "MED14dTAGvDMSO TC counts LFC",
+  ylab = "MED14dTAGvDMSO PolII LFC"
+  )
+abline(TC.m14.pol2$Pol2_LFC_MED14dTAG ~ TC.m14.pol2$logFC, col = "red")
+dev.off()
+
+# get sig only and plot
+sig.TC.m14.pol2 <- TC.m14.pol2[which(TC.m14.pol2$adj.P.Val < 0.05 & TC.m14.pol2$logFC), ]
+pdf(file.path(plots.dir, "Corr_plot_TCcounts_sigonly_MED14dTAG_LFC_PolII_LFC.pdf"))
+plotcor <- cor.test(sig.TC.m14.pol2$logFC, sig.TC.m14.pol2$Pol2_LFC_MED14dTAG, method = "spearman")
+plot(
+  sig.TC.m14.pol2$logFC, 
+  sig.TC.m14.pol2$Pol2_LFC_MED14dTAG, 
+  main = paste0("Spearman's rho: ", round(plotcor$estimate, 2)),
+  xlab = "MED14dTAGvDMSO TC counts LFC",
+  ylab = "MED14dTAGvDMSO PolII LFC"
+  )
+abline(sig.TC.m14.pol2$Pol2_LFC_MED14dTAG ~ sig.TC.m14.pol2$logFC, col = "red")
+dev.off()
+
+# now the same for total counts
+tot.m14.pol2 <- merge(tot.cont.ensg, m14.pol2, by.x = "ensembl_gene_id", by.y = "V1")
+tot.m14.pol2$V2 <- log2(tot.m14.pol2$V2)
+colnames(tot.m14.pol2)[14] <- "Pol2_LFC_MED14dTAG"
+
+pdf(file.path(plots.dir, "Corr_plot_counts_MED14dTAG_LFC_PolII_LFC.pdf"))
+plotcor <- cor.test(tot.m14.pol2$logFC, tot.m14.pol2$Pol2_LFC_MED14dTAG, method = "spearman")
+plot(
+  tot.m14.pol2$logFC, 
+  tot.m14.pol2$Pol2_LFC_MED14dTAG, 
+  main = paste0("Spearman's rho: ", round(plotcor$estimate, 2)),
+  xlab = "MED14dTAGvDMSO total counts LFC",
+  ylab = "MED14dTAGvDMSO PolII LFC"
+  )
+abline(tot.m14.pol2$Pol2_LFC_MED14dTAG ~ tot.m14.pol2$logFC, col = "red")
+dev.off()
+
+# get sig only and plot
+sig.tot.m14.pol2 <- tot.m14.pol2[which(tot.m14.pol2$adj.P.Val < 0.05 & tot.m14.pol2$logFC), ]
+pdf(file.path(plots.dir, "Corr_plot_counts_sigonly_MED14dTAG_LFC_PolII_LFC.pdf"))
+plotcor <- cor.test(sig.tot.m14.pol2$logFC, sig.tot.m14.pol2$Pol2_LFC_MED14dTAG, method = "spearman")
+plot(
+  sig.tot.m14.pol2$logFC, 
+  sig.tot.m14.pol2$Pol2_LFC_MED14dTAG, 
+  main = paste0("Spearman's rho: ", round(plotcor$estimate, 2)),
+  xlab = "MED14dTAGvDMSO total counts LFC",
+  ylab = "MED14dTAGvDMSO PolII LFC"
+  )
+abline(sig.tot.m14.pol2$Pol2_LFC_MED14dTAG ~ sig.tot.m14.pol2$logFC, col = "red")
+dev.off()
+```
+
+# make raw counts table for MED14 reps1-3 only for GEO upload
+```{r}
+med14.counts <- TCcounts.dge$counts[, grepl("MED14-.*R[1-3]", colnames(TCcounts.dge$counts))]
+write.table(
+  med14.counts,
+  "results/MED14_raw_TCcounts.txt",
+  sep = "\t",
+  col.names = NA,
+  row.names = TRUE,
+  quote = FALSE
+)
+```
+
+
+# save session info
+```{r}
+sesh.info <- capture.output(sessionInfo())
+writeLines(
+  sesh.info,
+  file.path(project.dir, "session-info", paste0(Sys.Date(), "_slamseq_230727.txt"))
+)
+```
