@@ -1,0 +1,70 @@
+---
+title: "ATACseq_221111"
+author: "Andrea"
+date: '2022-11-16'
+output: html_document
+---
+
+
+scratch project directory:
+/scratch/teams/dawson_genomics/Projects/CB_ChIP/ATACseq_221111
+
+FASTQ location:
+/pipeline/Runs/NextSeq/221111_NB501056_0881_AH7MKTBGXN/ProjectFolders/Project_Charles-Bell/
+
+# run fastqc first and check report
+```{bash}
+# from project scratch dir
+mkdir fastqc
+
+for fq in /pipeline/Runs/NextSeq/221111_NB501056_0881_AH7MKTBGXN/ProjectFolders/Project_Charles-Bell/*/*_R1_001.fastq.gz
+do
+bname=`basename $fq _R1_001.fastq.gz`
+sbatch scripts/fastqc.sbatch $fq /pipeline/Runs/NextSeq/221109_NB501056_0879_AH7NCGBGXN/ProjectFolders/Project_Charles-Bell/*/${bname}_R2_001.fastq.gz
+done
+
+# when fastqc is finished run multiqc 
+module load multiqc/1.8
+cd fastqc
+multiqc .
+cd ..
+```
+
+# run preprocessing steps then multiqc trimmed reads
+```{bash}
+mkdir trimmed_fastq
+mkdir bams
+
+for fq in /pipeline/Runs/NextSeq/221111_NB501056_0881_AH7MKTBGXN/ProjectFolders/Project_Charles-Bell/*/*_R1_001.fastq.gz
+do
+sbatch scripts/preprocessing.sbatch $fq 
+done
+
+# when preprocessing is finished is finished run multiqc 
+module load multiqc/1.8
+cd trimmed_fastq
+multiqc .
+cd ..
+```
+
+# make tdfs, filter below 150bp and proces small frag files
+```{bash}
+for bam in bams/*_dedup_sort_nMTnU_MAPQ.bam
+do
+sbatch scripts/more_processing.sbatch $bam
+done
+```
+
+# split bams into size bins, charlie thinks the raw bams are the best for this so running on those
+```{bash}
+for bam in bams/*.sort.bam
+do
+sbatch scripts/ATAC_bin_bams.sbatch $bam
+done
+
+# make bais and tdf for binned bam files
+for bam in bams/*.sort.bam
+do
+sbatch scripts/bin_bai_tdf.sbatch $bam
+done
+```
