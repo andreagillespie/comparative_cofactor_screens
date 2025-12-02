@@ -8,4 +8,4 @@ ChIP_230912: Chips for INTS5, MED12, MED14, & MED25 treated w/ DMSO, CDK8i, dTAG
 
 CUTandTAG_221109: CUT&TAG performed in EWS, GR, IRF1, MYB, NFKB, NOTCH, p53, PU-1, & VP64 lines w/ antibodies for K27ac & K4me3.
 
-SLAMseq_230914: 
+SLAMseq_230914: Performed in WT-K562 +/- CDK8i, and MED12, MED14, & MED25 lines +/- dTAG, n=3.
